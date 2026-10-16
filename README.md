@@ -42,6 +42,7 @@ Notes:
 
 - `better-sqlite3` is a native dependency. The included `.npmrc` (`allowScripts=better-sqlite3`) lets its prebuilt binaries install; if your npm blocks scripts, run `cd node_modules/better-sqlite3 && npm run install`.
 - Requires OpenCode v2.x and Node 18+.
+- Relative plugin paths resolve **from the config file that contains the entry**, so `"./plugins/context-mode-opencode-v2"` in `~/.config/opencode/opencode.json` means `~/.config/opencode/plugins/context-mode-opencode-v2`.
 
 ### Option B — GitHub plugin reference
 
@@ -53,13 +54,70 @@ Notes:
 
 OpenCode fetches GitHub plugins and installs their dependencies; if the native `better-sqlite3` build is blocked by your npm script policy, fall back to Option A.
 
+## How OpenCode discovers the plugin
+
+Two discovery paths exist, and mixing them loads the plugin twice:
+
+| Path | Loaded automatically? |
+|---|---|
+| `~/.config/opencode/plugins/<dir>/index.js` (global) | Yes — direct `.js`/`.ts` files and immediate plugin package directories are discovered |
+| `.opencode/plugins/<dir>/` in a project | Yes |
+| `plugins/` next to a project-root `opencode.json(c)` | **No** — must be listed in `plugins`, or moved under `.opencode/` |
+
+If you previously dropped a copy into `~/.config/opencode/plugins/` and now also list the directory in `plugins`, both instances load. Keep exactly one:
+
+```bash
+# move the stale copy out of the discovered plugins directory
+mv ~/.config/opencode/plugins/context-mode-v2 ~/.config/opencode/.backup/context-mode-v2-old
+```
+
+## Working on the plugin locally (dev setup)
+
+Point the global config at the checkout so edits are picked up without re-copying files:
+
+```jsonc
+// ~/.config/opencode/opencode.json
+{
+  "plugins": ["/absolute/path/to/context-mode-opencode-v2"]
+}
+```
+
+Then:
+
+```bash
+cd /absolute/path/to/context-mode-opencode-v2
+npm install
+opencode service restart
+```
+
+Reload behaviour:
+
+- Changes under watched config directories (`~/.config/opencode/`, `.opencode/`) reload automatically.
+- A local plugin directory outside those watched directories is **not** watched — after editing `index.js`, restart the service (`opencode service restart`).
+- Verified on OpenCode v2.0.30 with context-mode 1.0.169.
+- `@opencode/plugin` is provided by OpenCode's plugin runtime; it is intentionally not a dependency of this package.
+
 ## Verify
 
-After restarting OpenCode, the ctx tools should appear in the session tool catalog. Quick smoke test through Code Mode:
+```bash
+opencode plugin list
+# ID               VERSION  SOURCE
+# context-mode.v2  local    /absolute/path/to/context-mode-opencode-v2/index.js
+```
+
+The server log should show the plugin being loaded without errors:
+
+```bash
+grep -i "loading plugin" ~/.local/share/opencode/log/opencode.log | tail -3
+```
+
+Then smoke-test the tools through Code Mode:
 
 ```js
 await tools.ctx_stats()
 ```
+
+Rollback: delete the `plugins` entry from `opencode.json` and move the backup copy back into `~/.config/opencode/plugins/`.
 
 ## Caveats
 
