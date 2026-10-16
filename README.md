@@ -80,6 +80,38 @@ or `CONTEXT_MODE_AUTO_UPDATE=0` in the environment.
 
 If a future upstream release changes the adapter export shape or hook names, the wrapper fails loudly with an actionable message instead of silently registering zero tools.
 
+## Routing rules — no `AGENTS.md` copy needed
+
+Upstream's OpenCode docs tell you to copy the routing rules into your project:
+
+```bash
+cp node_modules/context-mode/configs/opencode/AGENTS.md AGENTS.md
+```
+
+That step is **optional here**. The adapter injects the same rules into the system prompt per session (`experimental.chat.system.transform`), and the wrapper maps that to `ctx.session.hook("context")`. PreToolUse enforcement (`tool.execute.before`) also runs: `curl`/`wget` and inline HTTP are rewritten, and raw-output-heavy commands get a think-in-code nudge.
+
+Two things the wrapper fixes around that injection:
+
+1. **Marker false positive.** The adapter skips injection when the system prompt already contains a quorum of `ROUTING_MARKERS` (`<context_window_protection>`, `ctx_search`, `ctx_index`). Harnesses that merely *list* ctx tool names in the tool catalog (Code Mode, MCP tool listings) trip that check, so the rules never reach the prompt even though no rules are present. The wrapper detects this and injects the upstream routing block itself, built from `context-mode/hooks/routing-block.mjs` with the tool names actually registered.
+2. **Tool-name mismatch.** Upstream guidance text uses the MCP-style OpenCode convention (`context-mode_ctx_execute`), but native plugin tools are registered bare (`ctx_execute`). The wrapper rewrites guidance to the registered names, so the model is pointed at tools that exist.
+
+Check what is actually active:
+
+```
+ctx_routing({ verbose: true })
+```
+
+```
+Routing status
+  context-mode 1.0.169 · wrapper 1.1.0
+  ctx tools registered: 11 (ctx_execute, ctx_search, ...)
+  PreToolUse enforcement: 2 decision(s) observed (modify 2, context 0, deny 0)
+  routing block: injected by wrapper — adapter skipped it because the tool catalog tripped its marker quorum
+  project rules: AGENTS.md: 0 routing marker(s)
+```
+
+Turn the wrapper-side injection off with `"options": { "routingBlock": false }` or `CONTEXT_MODE_ROUTING_BLOCK=0`. If you do copy `configs/opencode/AGENTS.md` into your project, the wrapper sees the real rules and does not duplicate them.
+
 ## Dependency boundary
 
 This package is a thin adapter, not a fork. Everything except `index.js` (~150 lines) comes from upstream:

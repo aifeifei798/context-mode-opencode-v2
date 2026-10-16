@@ -26,6 +26,7 @@ const mod = await import(join(PLUGIN_DIR, "index.js"))
 
 const tools = []
 const hooks = []
+const handlers = {}
 
 const ctx = {
   location: { directory: PLUGIN_DIR },
@@ -36,9 +37,17 @@ const ctx = {
       const editor = { add: (t) => tools.push(t) }
       await callback(editor)
     },
-    hook: (name) => hooks.push("tool." + name),
+    hook: (name, handler) => {
+      hooks.push("tool." + name)
+      handlers["tool." + name] = handler
+    },
   },
-  session: { hook: (name) => hooks.push("session." + name) },
+  session: {
+    hook: (name, handler) => {
+      hooks.push("session." + name)
+      handlers["session." + name] = handler
+    },
+  },
   event: {
     subscribe: ({ signal }) => ({
       [Symbol.asyncIterator]: () => ({
@@ -66,6 +75,7 @@ const expectedTools = [
   "ctx_upgrade",
   "ctx_purge",
   "ctx_insight",
+  "ctx_routing",
 ]
 
 const missing = expectedTools.filter((name) => !tools.some((t) => t.name === name))
@@ -83,10 +93,68 @@ if (stats) {
   console.log("ctx_stats metadata:", JSON.stringify(out.metadata))
 }
 
+// ── routing block injection + tool-name normalization ────────────────────
+const contextHook = handlers["session.context"]
+let injectionOk = false
+let wrapperInjectionOk = false
+let namingOk = false
+if (contextHook) {
+  const event = { sessionID: "ses_smoke_routing", system: [{ type: "text", text: "You are an assistant." }] }
+  await contextHook(event)
+  const joined = event.system.map((p) => p.text).join("\n")
+  injectionOk = joined.includes("<context_window_protection>")
+  namingOk = !joined.includes("context-mode_ctx_")
+  console.log("routing block injected by adapter:", injectionOk)
+  console.log("guidance names normalized:", namingOk)
+
+  // Harnesses that only *list* ctx tool names (tool catalogs) trip the adapter's
+  // marker quorum; the wrapper must still supply the rules.
+  const catalogEvent = {
+    sessionID: "ses_smoke_catalog",
+    system: [
+      { type: "text", text: "You are an assistant." },
+      { type: "text", text: "Available tools: ctx_search, ctx_index, ctx_execute." },
+    ],
+  }
+  await contextHook(catalogEvent)
+  const catalogJoined = catalogEvent.system.map((p) => p.text).join("\n")
+  wrapperInjectionOk = catalogJoined.includes("<context_window_protection>") && !catalogJoined.includes("context-mode_ctx_")
+  console.log("routing block supplied by wrapper when adapter skips:", wrapperInjectionOk)
+}
+
+// ── PreToolUse enforcement + normalization ────────────────────────────────
+let redirectOk = false
+const beforeHook = handlers["tool.execute.before"]
+if (beforeHook) {
+  const event = { tool: "shell", sessionID: "ses_smoke_routing", input: { command: "curl -s https://example.com" } }
+  await beforeHook(event)
+  const rewritten = String(event.input.command ?? "")
+  redirectOk = rewritten.includes("redirected") && rewritten.includes("ctx_execute") && !rewritten.includes("context-mode_ctx_")
+  console.log("curl redirect rewritten:", redirectOk)
+}
+
+// ── ctx_routing report ─────────────────────────────────────────────────────
+let reportOk = false
+const routing = tools.find((t) => t.name === "ctx_routing")
+if (routing) {
+  const out = await routing.execute({ verbose: true }, { sessionID: "ses_smoke_routing", directory: PLUGIN_DIR })
+  reportOk = String(out.content).startsWith("Routing status")
+  console.log("ctx_routing output:\n" + String(out.content))
+}
+
 if (createdStub) rmSync(stubDir, { recursive: true, force: true })
 
-if (missing.length || badSchemas.length) {
-  console.error("FAILED: missing tools", missing, "invalid schemas", badSchemas.map((t) => t.name))
+if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk) {
+  console.error(
+    "FAILED:",
+    missing.length ? "missing tools " + missing.join(",") : "",
+    badSchemas.length ? "invalid schemas " + badSchemas.map((t) => t.name).join(",") : "",
+    !injectionOk ? "routing block not injected" : "",
+    !wrapperInjectionOk ? "wrapper did not supply routing rules when adapter skipped" : "",
+    !namingOk ? "routing guidance not normalized" : "",
+    !redirectOk ? "PreToolUse redirect not normalized" : "",
+    !reportOk ? "ctx_routing report malformed" : "",
+  )
   process.exit(1)
 }
 console.log("OK")

@@ -20,7 +20,7 @@ OpenCode v2 plugin wrapper for context-mode (mksglu/context-mode). The upstream 
 | `tool.execute.after` | `ctx.tool.hook("execute.after")` (normalize `event.result` to a string `output`) |
 | `chat.message` | `ctx.session.hook("prompt")` |
 | `experimental.session.compacting` | `ctx.session.hook("compaction")` (v1 `output.context` → v2 `event.system` parts) |
-| `experimental.chat.system.transform` | `ctx.session.hook("context")` |
+| `experimental.chat.system.transform` | `ctx.session.hook("context")` — routing block + resume snapshot, plus wrapper-side routing backfill (see Routing) |
 | `event` (message.updated) | `ctx.event.subscribe` with an `AbortController`; cleanup returned from `setup` |
 
 Gotchas an agent is likely to miss:
@@ -29,6 +29,20 @@ Gotchas an agent is likely to miss:
 - `package.json` declares `zod ^3.25`, but the code imports `zod/v4` (the v4 API subpath shipped in zod 3.25+). Do not "fix" this to a plain `zod` import; `z.toJSONSchema` with `io: "input"` is required.
 - v1 tool `execute` closures re-parse args with the original zod v3 schemas (coercions/defaults), so pass through the JSON-Schema-validated input as-is; return `{ content, metadata: { title } }`.
 - Usage capture (`message.updated`) is best-effort and must never throw out of the session — keep the `try/catch`.
+
+## Routing
+
+Beyond the mechanical hook mapping, the wrapper owns three routing behaviours:
+
+- **`ctx_routing` tool** (wrapper-only, not in upstream) reports versions, the registered ctx tool names, PreToolUse decision counters (modify/context/deny inferred from what the adapter mutates), whether the routing block reached the system prompt, and routing markers found in `AGENTS.md`/`CLAUDE.md`/`CONTEXT.md`.
+- **Routing block backfill.** The adapter injects its `<context_window_protection>` block only when `systemHasRoutingInstructions()` is false. Tool catalogs that merely *list* `ctx_search`/`ctx_index` trip that quorum, so the rules never arrive. The wrapper checks for real rule markers (`<context_window_protection>`, "Every byte a tool returns", "PROGRAM the analysis, not COMPUTE it") and splices `createRoutingBlock` from `context-mode/hooks/routing-block.mjs` at index 1 (index 1, not unshift — same cache-fold reason as the adapter). Disable with the `routingBlock: false` plugin option or `CONTEXT_MODE_ROUTING_BLOCK=0`.
+- **Name normalization.** Upstream guidance text uses MCP-style OpenCode names (`context-mode_ctx_execute`); native plugin tools are bare (`ctx_execute`). `normalizeRoutingNames()` rewrites guidance in the system prompt and in PreToolUse rewrites, but only when the bare name is actually registered.
+
+Gotchas specific to routing:
+
+- `registeredNames` must stay a **live** `Set` populated inside the `ctx.tool.transform` callback. Snapshotting it with `new Set(registeredCtxTools)` at setup time is empty, because OpenCode invokes the transform callback lazily — normalization then silently no-ops.
+- The routing block is built with an identity tool namer (`(bare) => bare`). If tools ever get prefixed names, pass a namer that maps to the registered names instead.
+- `routingState` is module-level, so counters are per process, not per session; `sessions` is a `Set` of session IDs that saw the block.
 
 ## Dependencies / setup
 

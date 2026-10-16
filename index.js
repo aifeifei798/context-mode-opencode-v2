@@ -16,7 +16,7 @@
 import { Plugin } from "@opencode/plugin"
 import { spawn, spawnSync } from "node:child_process"
 import { dirname, join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
@@ -198,6 +198,31 @@ function scheduleContextModeUpdate(ctx, enabled) {
 // plugin loader. Cheap no-op once node_modules/context-mode exists.
 const dependency = ensureContextMode()
 
+function wrapperVersion() {
+  try {
+    return JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Routing observability. The wrapper cannot see the adapter's internal
+ * decisions, so it infers them from what the adapter mutates: a rewritten
+ * `command` is a modify, an added `additionalContext` is a context nudge, and
+ * a thrown error is a deny.
+ */
+const routingState = {
+  injected: false,
+  wrapperInjected: false,
+  skipped: false,
+  modify: 0,
+  context: 0,
+  deny: 0,
+  sessions: new Set(),
+  lastRewrite: null,
+}
+
 export default Plugin.define({
   id: "context-mode.v2",
   async setup(ctx) {
@@ -241,9 +266,48 @@ export default Plugin.define({
       )
     }
 
+    // ── routing block ────────────────────────────────────────────────────
+    // The adapter only injects its routing block when the system prompt does not
+    // already contain a quorum of ROUTING_MARKERS (`<context_window_protection>`,
+    // `ctx_search`, `ctx_index`). Harnesses that merely *list* ctx tool names in
+    // the tool catalog (Code Mode, MCP tool listings) trip that check, so the
+    // rules never reach the prompt even though no rules are actually present.
+    // Build the same block from upstream with the names registered here and
+    // inject it when the real rules are missing.
+    let wrapperRoutingBlock = null
+    if (ctx.options?.routingBlock !== false && process.env.CONTEXT_MODE_ROUTING_BLOCK !== "0") {
+      try {
+        const routingBlockPath = join(
+          PLUGIN_DIR,
+          "node_modules",
+          "context-mode",
+          "hooks",
+          "routing-block.mjs",
+        )
+        if (existsSync(routingBlockPath)) {
+          const { createRoutingBlock } = await import(pathToFileURL(routingBlockPath).href)
+          wrapperRoutingBlock = createRoutingBlock((bare) => bare)
+        }
+      } catch {
+        wrapperRoutingBlock = null
+      }
+    }
+
+    // Distinctive phrases from the upstream routing block / configs AGENTS.md.
+    // Any one of these means the rules are genuinely in the system prompt.
+    const ROUTING_RULE_MARKERS = [
+      "<context_window_protection>",
+      "Every byte a tool returns",
+      "PROGRAM the analysis, not COMPUTE it",
+    ]
+
     // ── ctx_* tools ─────────────────────────────────────────────────────
+    const registeredCtxTools = []
+    const registeredNames = new Set()
     await ctx.tool.transform((editor) => {
       for (const [name, tool] of Object.entries(hooks.tool ?? {})) {
+        registeredCtxTools.push(name)
+        registeredNames.add(name)
         const shape = tool.args && typeof tool.args === "object" ? tool.args : {}
         editor.add({
           name,
@@ -263,15 +327,106 @@ export default Plugin.define({
           },
         })
       }
+
+      editor.add({
+        name: "ctx_routing",
+        description:
+          "Report context-mode routing status: whether the routing block is injected into the system prompt, whether PreToolUse enforcement is firing, the ctx tool names the model can actually call, and any routing markers found in AGENTS.md.",
+        input: z.toJSONSchema(
+          z.object({ verbose: z.boolean().optional() }),
+          { io: "input" },
+        ),
+        execute: async (input) => ({
+          content: routingReport(Boolean(input?.verbose)),
+          metadata: { title: "Routing Status" },
+        }),
+      })
     })
+
+    // Upstream routing text uses the MCP-style OpenCode tool naming
+    // (`context-mode_ctx_execute`) because the adapter was written for the MCP
+    // path. Native plugin tools are registered bare, so rewrite guidance to the
+    // names the model can actually call. Only rewrite when the bare name is
+    // registered, so a future upstream that registers prefixed names is left
+    // untouched.
+    function normalizeRoutingNames(text) {
+      if (typeof text !== "string" || !text.includes("context-mode_")) return text
+      return text.replace(/context-mode_([a-z_]+)/g, (match, bare) =>
+        registeredNames.has(bare) ? bare : match,
+      )
+    }
+
+    function routingReport(verbose) {
+      const markerHits = []
+      for (const file of ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"]) {
+        const path = join(directory, file)
+        if (!existsSync(path)) continue
+        let text = ""
+        try {
+          text = readFileSync(path, "utf8")
+        } catch {
+          continue
+        }
+        const markers = (adapterMod.ROUTING_MARKERS ?? []).filter((m) => text.includes(m))
+        markerHits.push(`${file}: ${markers.length} routing marker(s)`)
+      }
+
+      const blockStatus = routingState.injected
+        ? "injected by adapter"
+        : routingState.wrapperInjected
+          ? "injected by wrapper — adapter skipped it because the tool catalog tripped its marker quorum"
+          : routingState.skipped
+            ? "not injected — real routing rules already present in the system prompt"
+            : "not yet observed in this process"
+
+      const lines = [
+        "Routing status",
+        `  context-mode ${installedContextModeVersion() ?? "unknown"} · wrapper ${wrapperVersion()}`,
+        `  ctx tools registered: ${registeredCtxTools.length} (${registeredCtxTools.join(", ")})`,
+        `  tool naming: bare ctx_* — upstream's context-mode_* guidance names are normalized to the registered names`,
+        `  PreToolUse enforcement: ${routingState.modify + routingState.context + routingState.deny} decision(s) observed (modify ${routingState.modify}, context ${routingState.context}, deny ${routingState.deny})`,
+        `  routing block: ${blockStatus}`,
+      ]
+      if (markerHits.length) lines.push(`  project rules: ${markerHits.join("; ")}`)
+      if (verbose) {
+        lines.push(`  plugin dir: ${PLUGIN_DIR}`)
+        lines.push(`  sessions with routing block: ${routingState.sessions.size}`)
+        if (routingState.lastRewrite) {
+          lines.push(`  last PreToolUse rewrite: ${String(routingState.lastRewrite).slice(0, 160)}`)
+        }
+        lines.push(
+          "  note: copying configs/opencode/AGENTS.md is optional — the adapter injects the same rules per session and skips injection when markers are already present",
+        )
+      }
+      return lines.join("\n")
+    }
 
     // ── PreToolUse: routing enforcement (deny / modify / passthrough) ───
     if (hooks["tool.execute.before"]) {
       await ctx.tool.hook("execute.before", async (event) => {
-        await hooks["tool.execute.before"](
-          { tool: event.tool, sessionID: event.sessionID },
-          { args: event.input },
-        )
+        const args = event.input ?? {}
+        const commandBefore = typeof args.command === "string" ? args.command : null
+        const contextBefore = typeof args.additionalContext === "string"
+        try {
+          await hooks["tool.execute.before"](
+            { tool: event.tool, sessionID: event.sessionID },
+            { args },
+          )
+        } catch (error) {
+          routingState.deny += 1
+          throw error
+        }
+        // The adapter mutates `args` in place; align any tool names it injects
+        // with the names actually registered on the v2 tool surface.
+        if (typeof args.command === "string") args.command = normalizeRoutingNames(args.command)
+        if (typeof args.additionalContext === "string") {
+          args.additionalContext = normalizeRoutingNames(args.additionalContext)
+          if (!contextBefore) routingState.context += 1
+        }
+        if (commandBefore !== null && args.command !== commandBefore) {
+          routingState.modify += 1
+          routingState.lastRewrite = args.command
+        }
       })
     }
 
@@ -326,14 +481,35 @@ export default Plugin.define({
     // ── system.transform: routing block + resume snapshot injection ─────
     if (hooks["experimental.chat.system.transform"]) {
       await ctx.session.hook("context", async (event) => {
-        const strings = event.system.map((part) => part?.text ?? "")
+        const system = Array.isArray(event.system) ? event.system : []
+        const strings = system.map((part) => part?.text ?? "")
+        const markerQuorum =
+          typeof adapterMod.systemHasRoutingInstructions === "function" &&
+          adapterMod.systemHasRoutingInstructions(strings)
         await hooks["experimental.chat.system.transform"](
           { sessionID: event.sessionID },
           { system: strings },
         )
+        if (strings.some((text) => text.includes("<context_window_protection>"))) {
+          routingState.injected = true
+          routingState.sessions.add(event.sessionID)
+        } else if (ROUTING_RULE_MARKERS.some((marker) => strings.join("\n").includes(marker))) {
+          routingState.skipped = true
+        } else if (wrapperRoutingBlock) {
+          // Adapter skipped injection because the tool catalog tripped its marker
+          // quorum. Splice at index 1 (after the header) for the same cache-fold
+          // reason the adapter uses.
+          try {
+            strings.splice(1, 0, wrapperRoutingBlock)
+            routingState.wrapperInjected = true
+            routingState.sessions.add(event.sessionID)
+          } catch {
+            // Never break the turn over a routing-block splice failure.
+          }
+        }
         event.system.length = 0
         for (const text of strings) {
-          event.system.push({ type: "text", text: String(text) })
+          event.system.push({ type: "text", text: normalizeRoutingNames(String(text)) })
         }
       })
     }
