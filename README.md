@@ -20,9 +20,22 @@ This wrapper calls the upstream adapter factory and re-registers everything on t
 
 ## Install
 
-### Option A — local plugin directory (recommended)
+The plugin installs its own dependencies. OpenCode does **not** run `npm install` for local plugin directories, so `index.js` bootstraps `context-mode` into the plugin's own directory the first time it is loaded.
 
-OpenCode does not auto-install npm dependencies for local plugin directories, so install them manually:
+### Option A — drop it in (recommended)
+
+```bash
+mkdir -p ~/.config/opencode/plugins/context-mode-opencode-v2
+cp index.js ~/.config/opencode/plugins/context-mode-opencode-v2/index.js
+```
+
+That is the whole setup: on first load the wrapper writes a `package.json` if none exists, runs `npm install`, and registers the ctx tools.
+
+```bash
+opencode plugin list
+```
+
+### Option B — point OpenCode at a checkout
 
 ```bash
 git clone https://github.com/aifeifei798/context-mode-opencode-v2
@@ -30,29 +43,42 @@ cd context-mode-opencode-v2
 npm install
 ```
 
-Then point OpenCode at the directory in `~/.config/opencode/opencode.json`:
-
 ```jsonc
+// ~/.config/opencode/opencode.json
 {
-  "plugins": ["./plugins/context-mode-opencode-v2"]
+  "plugins": ["/absolute/path/to/context-mode-opencode-v2"]
 }
 ```
+
+`npm install` is optional here too — the bootstrap runs it if `node_modules/context-mode` is missing.
+
+### Option C — install as a package plugin
+
+```bash
+opencode plugin add github:aifeifei798/context-mode-opencode-v2
+```
+
+OpenCode installs package plugins and their dependencies, and `opencode plugin update` upgrades them.
 
 Notes:
 
-- `better-sqlite3` is a native dependency. The included `.npmrc` (`allowScripts=better-sqlite3`) lets its prebuilt binaries install; if your npm blocks scripts, run `cd node_modules/better-sqlite3 && npm run install`.
 - Requires OpenCode v2.x and Node 18+.
+- `better-sqlite3` is a native dependency. npm 12+ blocks install scripts unless `allowScripts` is declared in **package.json** (the `.npmrc` form is no longer recognised). It is declared here; if the native binding is still missing, run `cd node_modules/better-sqlite3 && npm run install`.
 - Relative plugin paths resolve **from the config file that contains the entry**, so `"./plugins/context-mode-opencode-v2"` in `~/.config/opencode/opencode.json` means `~/.config/opencode/plugins/context-mode-opencode-v2`.
 
-### Option B — GitHub plugin reference
+## Keeping context-mode up to date
+
+`package.json` declares `context-mode` with a caret range, and the wrapper checks npm for a newer release once per day in the background (never blocking plugin load). The upgraded version is picked up on the next plugin reload.
+
+Disable it with either:
 
 ```jsonc
-{
-  "plugins": ["github:aifeifei798/context-mode-opencode-v2"]
-}
+{ "plugins": [{ "package": "./plugins/context-mode-opencode-v2", "options": { "autoUpdate": false } }] }
 ```
 
-OpenCode fetches GitHub plugins and installs their dependencies; if the native `better-sqlite3` build is blocked by your npm script policy, fall back to Option A.
+or `CONTEXT_MODE_AUTO_UPDATE=0` in the environment.
+
+If a future upstream release changes the adapter export shape or hook names, the wrapper fails loudly with an actionable message instead of silently registering zero tools.
 
 ## How OpenCode discovers the plugin
 

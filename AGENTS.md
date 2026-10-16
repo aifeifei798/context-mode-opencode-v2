@@ -5,7 +5,8 @@ OpenCode v2 plugin wrapper for context-mode (mksglu/context-mode). The upstream 
 ## Structure
 
 - `index.js` is the entire plugin — one default export, no other source files.
-- No build, test, lint, or typecheck scripts exist in `package.json`. Verify changes by loading the plugin in OpenCode (`"plugins": ["./plugins/context-mode-opencode-v2"]` in `opencode.json`) and smoke-testing `await tools.ctx_stats()` via Code Mode.
+- `index.js` runs `ensureContextMode()` at **module load time** (top level, before `Plugin.define`), so `context-mode` is installed before the plugin loader resolves anything. Do not move that call into `setup`; the loader can attempt a load before `setup` finishes.
+- No build, test, lint, or typecheck scripts exist in `package.json`. Verify changes by loading the plugin in OpenCode (`"plugins": ["/absolute/path/to/context-mode-opencode-v2"]` in `opencode.json`) and smoke-testing `await tools.ctx_stats()` via Code Mode.
 - ESM (`"type": "module"`), Node 18+, OpenCode v2.x required.
 
 ## How the adapter works (read before editing)
@@ -31,5 +32,7 @@ Gotchas an agent is likely to miss:
 
 ## Dependencies / setup
 
-- `npm install` is required for local plugin directories (OpenCode does not auto-install deps for local plugins).
-- `better-sqlite3` is a native transitive dep of context-mode; `.npmrc` sets `allowScripts=better-sqlite3` so its prebuilt binaries install. If npm blocks scripts: `cd node_modules/better-sqlite3 && npm run install`.
+- OpenCode does **not** install npm dependencies for local plugin directories, so `index.js` self-installs: if `node_modules/context-mode` is missing it writes a fallback `package.json` (when none exists) and runs `npm install --no-audit --no-fund` in the plugin's own directory via `spawnSync`. Verified end-to-end by deleting `node_modules` and touching `index.js`.
+- npm 12+ blocks install scripts unless `allowScripts` is declared in **package.json**; the `.npmrc` form is now an unknown config and was removed. `allowScripts` entries here cover `better-sqlite3` and `context-mode` (postinstall). If the native binding is still missing: `cd node_modules/better-sqlite3 && npm run install`.
+- `scheduleContextModeUpdate()` runs `npm view context-mode version` once per 24 h in the background (cooldown stored in `ctx.storage`) and installs a newer release if found. It never blocks setup; the new version is picked up on the next reload. Disable with `CONTEXT_MODE_AUTO_UPDATE=0` or the `autoUpdate: false` plugin option.
+- `@opencode/plugin` is supplied by OpenCode's runtime and is intentionally not a dependency.

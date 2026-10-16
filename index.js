@@ -5,14 +5,140 @@
  * (`context-mode/build/adapters/opencode/plugin.js`). OpenCode v2 requires
  * plugins that export `Plugin.define({ id, setup })`, so this wrapper calls
  * the upstream v1 factory and re-registers its tools and hooks on the v2 API.
+ *
+ * Self-installing: OpenCode does not install npm dependencies for local
+ * plugin directories, so this wrapper installs `context-mode` into its own
+ * directory at module load time (before anything is imported) when it is
+ * missing. Dropping `index.js` into `~/.config/opencode/plugins/` is enough.
+ * Set `CONTEXT_MODE_AUTO_UPDATE=0` (or the `autoUpdate: false` plugin option)
+ * to disable the background upgrade check.
  */
 import { Plugin } from "@opencode/plugin"
+import { spawnSync } from "node:child_process"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
+
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
+const CONTEXT_MODE_DIR = join(PLUGIN_DIR, "node_modules", "context-mode")
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+/** Minimal package.json so a bare `index.js` drop-in still installs deps. */
+const FALLBACK_PACKAGE_JSON = {
+  name: "context-mode-opencode-v2",
+  version: "1.0.0",
+  type: "module",
+  dependencies: { "context-mode": "^1.0.169", zod: "^3.25.0" },
+  allowScripts: {
+    "better-sqlite3": true,
+    "context-mode": true,
+  },
+}
+
+function npmInstall(args, timeoutMs) {
+  return spawnSync("npm", ["install", "--no-audit", "--no-fund", ...args], {
+    cwd: PLUGIN_DIR,
+    encoding: "utf8",
+    timeout: timeoutMs,
+  })
+}
+
+/**
+ * Ensure context-mode is available. Blocking, only when missing.
+ * npm 12+ blocks install scripts unless `allowScripts` is declared in
+ * package.json, which is why better-sqlite3's prebuilt binary needs it.
+ */
+function ensureContextMode() {
+  if (existsSync(CONTEXT_MODE_DIR)) return { ok: true, action: "present" }
+
+  if (!existsSync(join(PLUGIN_DIR, "package.json"))) {
+    try {
+      writeFileSync(join(PLUGIN_DIR, "package.json"), JSON.stringify(FALLBACK_PACKAGE_JSON, null, 2) + "\n")
+    } catch (error) {
+      return { ok: false, action: "no-package-json", error: error.message }
+    }
+  }
+
+  const result = npmInstall([], 180_000)
+  if (result.status === 0 && existsSync(CONTEXT_MODE_DIR)) {
+    return { ok: true, action: "installed" }
+  }
+  return {
+    ok: false,
+    action: "install-failed",
+    error: result.error?.message || result.stderr?.trim() || `npm exited with ${result.status}`,
+  }
+}
+
+function installedContextModeVersion() {
+  try {
+    return JSON.parse(readFileSync(join(CONTEXT_MODE_DIR, "package.json"), "utf8")).version
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Background upgrade check: pull the latest context-mode once a day.
+ * Never blocks plugin setup; the new version is picked up on the next load.
+ */
+function scheduleContextModeUpdate(ctx, enabled) {
+  if (!enabled) return
+  void (async () => {
+    try {
+      const lastCheck = await ctx.storage.get("contextModeUpdateCheck")
+      if (lastCheck && Date.now() - Number(lastCheck) < UPDATE_CHECK_INTERVAL_MS) return
+      await ctx.storage.set("contextModeUpdateCheck", Date.now())
+
+      const view = spawnSync("npm", ["view", "context-mode", "version"], {
+        cwd: PLUGIN_DIR,
+        encoding: "utf8",
+        timeout: 30_000,
+      })
+      if (view.status !== 0) return
+      const latest = view.stdout?.trim()
+      const current = installedContextModeVersion()
+      if (!latest || latest === current) return
+
+      const result = npmInstall(["context-mode@" + latest], 180_000)
+      await ctx.storage.set("contextModeUpdate", {
+        from: current,
+        to: latest,
+        ok: result.status === 0,
+        at: Date.now(),
+      })
+    } catch {
+      // Update checks are best-effort; never break the session.
+    }
+  })()
+}
+
+// Run at module load, before any context-mode import is resolved by the
+// plugin loader. Cheap no-op once node_modules/context-mode exists.
+const dependency = ensureContextMode()
 
 export default Plugin.define({
   id: "context-mode.v2",
   async setup(ctx) {
+    if (!dependency.ok) {
+      throw new Error(
+        `context-mode-opencode-v2 could not install context-mode (${dependency.error}). ` +
+          `Run "npm install" in ${PLUGIN_DIR}, or install the plugin as a package: ` +
+          `opencode plugin add github:aifeifei798/context-mode-opencode-v2`
+      )
+    }
+
+    scheduleContextModeUpdate(ctx, ctx.options?.autoUpdate !== false && process.env.CONTEXT_MODE_AUTO_UPDATE !== "0")
+
     const adapterMod = await import("context-mode/plugin")
     const createContextModePlugin = adapterMod.server ?? adapterMod.ContextModePlugin
+    if (typeof createContextModePlugin !== "function") {
+      throw new Error(
+        `context-mode ${installedContextModeVersion()} does not export a plugin factory ` +
+          "(expected `server` or `ContextModePlugin`). Pin context-mode to 1.0.169 or update the wrapper."
+      )
+    }
+
     const { z } = await import("zod/v4")
 
     const directory = ctx.location?.directory ?? process.cwd()
@@ -26,6 +152,13 @@ export default Plugin.define({
         },
       },
     })
+
+    if (!hooks.tool || Object.keys(hooks.tool).length === 0) {
+      throw new Error(
+        `context-mode ${installedContextModeVersion()} returned no ctx tools. ` +
+          "The upstream adapter shape changed; update the wrapper or pin context-mode to 1.0.169."
+      )
+    }
 
     // ── ctx_* tools ─────────────────────────────────────────────────────
     await ctx.tool.transform((editor) => {
