@@ -1,0 +1,11 @@
+{
+  "name": "context-mode-opencode-v2",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "OpenCode v2 plugin wrapper for context-mode (mksglu/context-mode), adapting its v1-style adapter to the v2 Plugin.define API.",
+  "license": "MIT",
+  "dependencies": {
+    "context-mode": "^1.0.169",
+    "zod": "^3.25.0"
+  }
+}
