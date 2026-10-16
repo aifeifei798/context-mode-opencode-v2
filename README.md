@@ -63,7 +63,7 @@ OpenCode installs package plugins and their dependencies, and `opencode plugin u
 Notes:
 
 - Requires OpenCode v2.x and Node 18+.
-- `better-sqlite3` is a native dependency. npm 12+ blocks install scripts unless `allowScripts` is declared in **package.json** (the `.npmrc` form is no longer recognised). It is declared here; if the native binding is still missing, run `cd node_modules/better-sqlite3 && npm run install`.
+- `better-sqlite3` is a native dependency. npm 12+ blocks install scripts unless `allowScripts` is declared in **package.json** (the `.npmrc` form is no longer recognised). It is declared here. The wrapper also checks for the compiled binding (`node_modules/better-sqlite3/build/Release/better_sqlite3.node`) and heals it with `npm rebuild better-sqlite3` if it is missing — this is the case when OpenCode installs a package plugin with Bun and skips install scripts.
 - Relative plugin paths resolve **from the config file that contains the entry**, so `"./plugins/context-mode-opencode-v2"` in `~/.config/opencode/opencode.json` means `~/.config/opencode/plugins/context-mode-opencode-v2`.
 
 ## Keeping context-mode up to date
@@ -79,6 +79,37 @@ Disable it with either:
 or `CONTEXT_MODE_AUTO_UPDATE=0` in the environment.
 
 If a future upstream release changes the adapter export shape or hook names, the wrapper fails loudly with an actionable message instead of silently registering zero tools.
+
+## Dependency boundary
+
+This package is a thin adapter, not a fork. Everything except `index.js` (~150 lines) comes from upstream:
+
+| Layer | What it is | Size | License |
+|---|---|---|---|
+| `index.js` (this repo) | v1 → v2 hook/tool adapter + dependency bootstrap | ~150 lines | MIT |
+| `context-mode/build/adapters/opencode/` | upstream OpenCode adapter | ~1,000 lines | Elastic License 2.0 |
+| `context-mode` core engine | indexing, search, session storage, bundles | ~10,000 lines / ~2.4 MB | Elastic License 2.0 |
+| `better-sqlite3` | native SQLite binding used by the core | native | MIT |
+
+Runtime data (per-session SQLite databases, indexed content) lives in `~/.config/opencode/context-mode/{sessions,content}` and is owned by the upstream engine, not by this wrapper.
+
+Because the core is **Elastic License 2.0**, this wrapper may not be redistributed as a hosted or managed service that runs context-mode for third parties. Self-hosted use, local installs, and npm/GitHub distribution of the adapter with attribution to [mksglu/context-mode](https://github.com/mksglu/context-mode) are fine.
+
+## Releasing
+
+```bash
+npm login
+npm publish          # package.json `files` limits the payload to index.js, README, LICENSE, AGENTS.md
+```
+
+After publishing, users get the zero-config path:
+
+```bash
+opencode plugin add context-mode-opencode-v2
+opencode plugin update context-mode-opencode-v2
+```
+
+Before releasing, run the offline smoke test (no OpenCode required): a scratch directory with `package.json` + `index.js` and a stub `node_modules/@opencode/plugin` exporting `Plugin.define`, then call `setup()` with a fake `ctx` and confirm 11 ctx tools register and `ctx_stats` returns output.
 
 ## How OpenCode discovers the plugin
 
@@ -147,9 +178,10 @@ Rollback: delete the `plugins` entry from `opencode.json` and move the backup co
 
 ## Caveats
 
-- The wrapper targets context-mode **1.0.169**. If upstream changes the adapter export shape (`server` / `ContextModePlugin`) or hook names, the wrapper may need updating.
+- The wrapper is tested against context-mode **1.0.169** and declares it with a caret range. If upstream changes the adapter export shape (`server` / `ContextModePlugin`) or hook names, the wrapper throws with an actionable message rather than silently loading nothing.
+- The bootstrap also checks for `better-sqlite3`'s native binding (`node_modules/better-sqlite3/build/Release/better_sqlite3.node`). If install scripts were blocked, it reports `native-binding-missing` instead of failing later at runtime.
 - ctx tools are exposed through Code Mode's `execute` catalog; long-running commands inside `ctx_batch_execute` are bounded by the `timeout` argument you pass, not by a platform default.
 
 ## License
 
-MIT
+MIT for this wrapper. The upstream `context-mode` engine it depends on is **Elastic License 2.0** — see [Dependency boundary](#dependency-boundary).

@@ -66,13 +66,74 @@ function npmInstall(args, timeoutMs) {
   })
 }
 
+function betterSqlite3Root() {
+  const roots = [
+    join(PLUGIN_DIR, "node_modules", "better-sqlite3"),
+    join(CONTEXT_MODE_DIR, "node_modules", "better-sqlite3"),
+  ]
+  return roots.find((root) => existsSync(root)) ?? null
+}
+
+/**
+ * better-sqlite3 is a transitive dep of context-mode (hoisted to the plugin's
+ * own node_modules, or nested under context-mode if not hoisted). When
+ * OpenCode installs a package plugin with Bun, install scripts may not run,
+ * so the native binding can be missing even though the package is present.
+ */
+function nativeBindingPresent() {
+  const root = betterSqlite3Root()
+  if (!root) return false
+  return (
+    existsSync(join(root, "build", "Release", "better_sqlite3.node")) ||
+    existsSync(join(root, "build", "Debug", "better_sqlite3.node"))
+  )
+}
+
+/**
+ * npm install does not re-run install scripts for packages that are already
+ * in node_modules, so a missing binding is healed with `npm rebuild` and then
+ * the package's own `install` script (prebuild-install || node-gyp rebuild).
+ */
+function healNativeBinding() {
+  const root = betterSqlite3Root()
+  if (!root) return false
+
+  spawnSync("npm", ["rebuild", "better-sqlite3"], {
+    cwd: PLUGIN_DIR,
+    encoding: "utf8",
+    timeout: 180_000,
+  })
+  if (nativeBindingPresent()) return true
+
+  spawnSync("npm", ["run", "install"], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 180_000,
+  })
+  return nativeBindingPresent()
+}
+
+function nativeBindingError() {
+  return {
+    ok: false,
+    action: "native-binding-missing",
+    error:
+      "better-sqlite3's native binding was not built (install scripts were blocked). " +
+      "Run `npm rebuild better-sqlite3` or `cd node_modules/better-sqlite3 && npm run install` in " + PLUGIN_DIR,
+  }
+}
+
 /**
  * Ensure context-mode is available. Blocking, only when missing.
  * npm 12+ blocks install scripts unless `allowScripts` is declared in
  * package.json, which is why better-sqlite3's prebuilt binary needs it.
  */
 function ensureContextMode() {
-  if (existsSync(CONTEXT_MODE_DIR)) return { ok: true, action: "present" }
+  if (existsSync(CONTEXT_MODE_DIR)) {
+    if (nativeBindingPresent()) return { ok: true, action: "present" }
+    if (healNativeBinding()) return { ok: true, action: "healed-native-binding" }
+    return nativeBindingError()
+  }
 
   if (!existsSync(join(PLUGIN_DIR, "package.json"))) {
     try {
@@ -84,7 +145,8 @@ function ensureContextMode() {
 
   const result = npmInstall([], 180_000)
   if (result.status === 0 && existsSync(CONTEXT_MODE_DIR)) {
-    return { ok: true, action: "installed" }
+    if (nativeBindingPresent() || healNativeBinding()) return { ok: true, action: "installed" }
+    return nativeBindingError()
   }
   return {
     ok: false,

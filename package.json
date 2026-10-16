@@ -1,9 +1,34 @@
 {
   "name": "context-mode-opencode-v2",
   "version": "1.1.0",
-  "type": "module",
   "description": "OpenCode v2 plugin wrapper for context-mode (mksglu/context-mode), adapting its v1-style adapter to the v2 Plugin.define API.",
   "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "context-mode",
+    "context",
+    "token",
+    "plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aifeifei798/context-mode-opencode-v2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "check": "node --check index.js"
+  },
   "dependencies": {
     "context-mode": "^1.0.169",
     "zod": "^3.25.0"
