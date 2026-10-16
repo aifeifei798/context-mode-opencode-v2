@@ -109,7 +109,12 @@ opencode plugin add context-mode-opencode-v2
 opencode plugin update context-mode-opencode-v2
 ```
 
-Before releasing, run the offline smoke test (no OpenCode required): a scratch directory with `package.json` + `index.js` and a stub `node_modules/@opencode/plugin` exporting `Plugin.define`, then call `setup()` with a fake `ctx` and confirm 11 ctx tools register and `ctx_stats` returns output.
+Before releasing, run the offline smoke test (no OpenCode process required):
+
+```bash
+npm run check    # node --check index.js
+npm run smoke    # stubs @opencode/plugin, calls setup(), asserts 11 ctx tools + ctx_stats output
+```
 
 ## How OpenCode discovers the plugin
 

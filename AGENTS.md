@@ -4,9 +4,9 @@ OpenCode v2 plugin wrapper for context-mode (mksglu/context-mode). The upstream 
 
 ## Structure
 
-- `index.js` is the entire plugin — one default export, no other source files.
+- `index.js` is the entire plugin — one default export, no other runtime source files. `scripts/smoke.mjs` is a test harness only and is never loaded by OpenCode.
 - `index.js` runs `ensureContextMode()` at **module load time** (top level, before `Plugin.define`), so `context-mode` is installed before the plugin loader resolves anything. Do not move that call into `setup`; the loader can attempt a load before `setup` finishes.
-- No build, test, lint, or typecheck scripts exist in `package.json` beyond `npm run check` (`node --check index.js`). Verify changes by loading the plugin in OpenCode (`"plugins": ["/absolute/path/to/context-mode-opencode-v2"]` in `opencode.json`) and smoke-testing `await tools.ctx_stats()` via Code Mode.
+- The only scripts in `package.json` are `npm run check` (`node --check index.js`) and `npm run smoke` (`node scripts/smoke.mjs`). The smoke test stubs `@opencode/plugin` in `node_modules`, calls `setup()` with a fake `ctx`, and asserts the ctx tools and hooks register — it does not need an OpenCode process. Verify changes in OpenCode as well by loading the plugin (`"plugins": ["/absolute/path/to/context-mode-opencode-v2"]` in `opencode.json`) and smoke-testing `await tools.ctx_stats()` via Code Mode.
 - ESM (`"type": "module"`), Node 18+, OpenCode v2.x required.
 
 ## How the adapter works (read before editing)

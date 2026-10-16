@@ -22,12 +22,14 @@
   },
   "files": [
     "index.js",
+    "scripts/smoke.mjs",
     "README.md",
     "LICENSE",
     "AGENTS.md"
   ],
   "scripts": {
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "context-mode": "^1.0.169",
