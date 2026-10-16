@@ -103,7 +103,9 @@ if (contextHook) {
   await contextHook(event)
   const joined = event.system.map((p) => p.text).join("\n")
   injectionOk = joined.includes("<context_window_protection>")
-  namingOk = !joined.includes("context-mode_ctx_")
+  const offending = [...new Set(joined.match(/context-mode_[a-z_]+/g) ?? [])]
+  namingOk = offending.length === 0
+  if (!namingOk) console.log("unnormalized names in prompt:", offending.join(", "))
   console.log("routing block injected by adapter:", injectionOk)
   console.log("guidance names normalized:", namingOk)
 

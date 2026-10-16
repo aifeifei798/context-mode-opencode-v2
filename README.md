@@ -103,7 +103,7 @@ ctx_routing({ verbose: true })
 
 ```
 Routing status
-  context-mode 1.0.169 · wrapper 1.1.0
+  context-mode 1.0.169 · wrapper 1.2.0
   ctx tools registered: 11 (ctx_execute, ctx_search, ...)
   PreToolUse enforcement: 2 decision(s) observed (modify 2, context 0, deny 0)
   routing block: injected by wrapper — adapter skipped it because the tool catalog tripped its marker quorum
@@ -129,23 +129,28 @@ Because the core is **Elastic License 2.0**, this wrapper may not be redistribut
 
 ## Releasing
 
+npm publishing is **not required**. OpenCode's `plugin add` accepts a Git package specifier, so the repository itself is the distribution channel:
+
+```bash
+opencode plugin add github:aifeifei798/context-mode-opencode-v2   # installs from the repo
+opencode plugin check                                            # reports outdated package plugins
+opencode plugin update                                           # re-resolves the repo
+```
+
+Verified on OpenCode v2.0.30: the Git path caches the repo under `~/.cache/opencode/npm/git-<name>-<hash>/`, installs `context-mode` as a dependency, and the wrapper heals the missing `better-sqlite3` binding on first load (OpenCode's package install leaves `node_modules/better-sqlite3/build` empty).
+
+If you do have an npm account, the same package can be published for the bare-name path:
+
 ```bash
 npm login
 npm publish          # package.json `files` limits the payload to index.js, README, LICENSE, AGENTS.md
-```
-
-After publishing, users get the zero-config path:
-
-```bash
-opencode plugin add context-mode-opencode-v2
-opencode plugin update context-mode-opencode-v2
 ```
 
 Before releasing, run the offline smoke test (no OpenCode process required):
 
 ```bash
 npm run check    # node --check index.js
-npm run smoke    # stubs @opencode/plugin, calls setup(), asserts 11 ctx tools + ctx_stats output
+npm run smoke    # stubs @opencode/plugin, calls setup(), asserts the 11 ctx tools + ctx_routing and the routing hooks
 ```
 
 ## How OpenCode discovers the plugin
