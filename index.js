@@ -14,7 +14,7 @@
  * to disable the background upgrade check.
  */
 import { Plugin } from "@opencode/plugin"
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
@@ -33,6 +33,29 @@ const FALLBACK_PACKAGE_JSON = {
     "better-sqlite3": true,
     "context-mode": true,
   },
+}
+
+/**
+ * Non-blocking npm run, used for the background upgrade check so plugin
+ * startup never waits on the network.
+ */
+function runNpm(args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("npm", args, { cwd: PLUGIN_DIR })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString() })
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString() })
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error(`npm ${args.join(" ")} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    child.on("error", (error) => { clearTimeout(timer); reject(error) })
+    child.on("close", (status) => {
+      clearTimeout(timer)
+      resolve({ status, stdout, stderr })
+    })
+  })
 }
 
 function npmInstall(args, timeoutMs) {
@@ -90,17 +113,13 @@ function scheduleContextModeUpdate(ctx, enabled) {
       if (lastCheck && Date.now() - Number(lastCheck) < UPDATE_CHECK_INTERVAL_MS) return
       await ctx.storage.set("contextModeUpdateCheck", Date.now())
 
-      const view = spawnSync("npm", ["view", "context-mode", "version"], {
-        cwd: PLUGIN_DIR,
-        encoding: "utf8",
-        timeout: 30_000,
-      })
+      const view = await runNpm(["view", "context-mode", "version"], 30_000)
       if (view.status !== 0) return
       const latest = view.stdout?.trim()
       const current = installedContextModeVersion()
       if (!latest || latest === current) return
 
-      const result = npmInstall(["context-mode@" + latest], 180_000)
+      const result = await runNpm(["install", "--no-audit", "--no-fund", "context-mode@" + latest], 180_000)
       await ctx.storage.set("contextModeUpdate", {
         from: current,
         to: latest,
