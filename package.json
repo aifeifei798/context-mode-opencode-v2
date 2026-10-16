@@ -29,7 +29,8 @@
   ],
   "scripts": {
     "check": "node --check index.js",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "reload": "node --check index.js && node scripts/smoke.mjs && opencode service restart"
   },
   "dependencies": {
     "context-mode": "^1.0.169",

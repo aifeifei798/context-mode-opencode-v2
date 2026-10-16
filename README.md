@@ -186,13 +186,14 @@ Then:
 ```bash
 cd /absolute/path/to/context-mode-opencode-v2
 npm install
-opencode service restart
+npm run reload   # node --check + smoke test + opencode service restart
 ```
 
-Reload behaviour:
+Reload behaviour (verified on OpenCode v2.0.30):
 
 - Changes under watched config directories (`~/.config/opencode/`, `.opencode/`) reload automatically.
-- A local plugin directory outside those watched directories is **not** watched — after editing `index.js`, restart the service (`opencode service restart`).
+- A local plugin directory outside those watched directories is **not** watched — editing `index.js` in the checkout does **not** hot-reload the running server (confirmed: the live session kept the old code until `opencode service restart`).
+- `npm run reload` is the one-liner for the edit → verify → restart loop.
 - Verified on OpenCode v2.0.30 with context-mode 1.0.169.
 - `@opencode/plugin` is provided by OpenCode's plugin runtime; it is intentionally not a dependency of this package.
 

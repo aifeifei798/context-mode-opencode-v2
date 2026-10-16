@@ -52,6 +52,7 @@ Gotchas specific to routing:
 - npm 12+ blocks install scripts unless `allowScripts` is declared in **package.json**; the `.npmrc` form is now an unknown config and was removed. `allowScripts` uses bare package names (`better-sqlite3`, `context-mode`) so upstream version bumps are not silently blocked. If the native binding is still missing: `cd node_modules/better-sqlite3 && npm run install`.
 - `scheduleContextModeUpdate()` runs `npm view context-mode version` once per 24 h in the background with `spawn` (non-blocking; cooldown stored in `ctx.storage`) and installs a newer release if found. The new version is picked up on the next reload. Disable with `CONTEXT_MODE_AUTO_UPDATE=0` or the `autoUpdate: false` plugin option.
 - `@opencode/plugin` is supplied by OpenCode's runtime and is intentionally not a dependency.
+- The checkout is not a watched config directory, so editing `index.js` does not hot-reload the running server (verified: a live session kept the old routing-report text until `opencode service restart`). `npm run reload` chains `node --check index.js`, the smoke test, and the restart.
 
 ## Dependency boundary / license
 
