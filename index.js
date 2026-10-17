@@ -221,6 +221,28 @@ const routingState = {
   deny: 0,
   sessions: new Set(),
   lastRewrite: null,
+  // Sessions whose tool registry predates this plugin: Code Mode reports
+  // `No tool named "ctx_*" is currently available` for every ctx call.
+  staleSessions: new Set(),
+  missingToolCalls: 0,
+  lastMissingTool: null,
+  lastCatalog: null,
+}
+
+// OpenCode does not hot-reload a session's tool registry, so a session created
+// before this plugin registered its tools keeps the old one until it is
+// reloaded. Code Mode surfaces that as a per-call error; we detect it and warn
+// once per session.
+const STALE_REGISTRY_ERROR = /No tool named "(ctx_[a-z_]+)" is currently available/i
+
+const STALE_REGISTRY_NOTE =
+  "<context_mode_stale_registry>\n" +
+  "ctx_* tools are not in this session's tool registry. Run \"opencode service restart\" " +
+  "or start a new session; until then do not call ctx_* tools.\n" +
+  "</context_mode_stale_registry>"
+
+function warn(message) {
+  process.stderr.write(`\x1b[33m[context-mode-v2] ${message}\x1b[0m\n`)
 }
 
 export default Plugin.define({
@@ -356,6 +378,21 @@ export default Plugin.define({
       )
     }
 
+    // The harness renders the Code Mode tool catalog from the session's own tool
+    // registry. If that registry predates this plugin, the catalog lists the
+    // built-in tools but none of ours — the model still sees the routing rules
+    // and burns turns on calls that cannot resolve.
+    function inspectCatalog(strings) {
+      if (!registeredCtxTools.length) return { found: false, visible: 0 }
+      const catalog = strings.find((text) => text.includes("## Available tools"))
+      if (!catalog) return { found: false, visible: 0 }
+      if (!/(read|shell|edit)/.test(catalog)) return { found: false, visible: 0 }
+      return {
+        found: true,
+        visible: registeredCtxTools.filter((name) => catalog.includes(name)).length,
+      }
+    }
+
     function routingReport(verbose) {
       const markerHits = []
       for (const file of ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"]) {
@@ -387,6 +424,18 @@ export default Plugin.define({
         `  PreToolUse enforcement: ${routingState.modify + routingState.context + routingState.deny} decision(s) observed (modify ${routingState.modify}, context ${routingState.context}, deny ${routingState.deny})`,
         `  routing block: ${blockStatus}`,
       ]
+      if (routingState.lastCatalog) {
+        lines.push(
+          `  tool catalog: ${routingState.lastCatalog.visible}/${registeredCtxTools.length} ctx tools visible in the last inspected session's catalog`,
+        )
+      }
+      if (routingState.staleSessions.size) {
+        lines.push(
+          `  stale tool registry: ${routingState.staleSessions.size} session(s) in this process cannot call ctx tools ` +
+            `(last failed call: ${routingState.lastMissingTool}, ${routingState.missingToolCalls} failure(s)) — ` +
+            `run "opencode service restart" or start a new session`,
+        )
+      }
       if (markerHits.length) lines.push(`  project rules: ${markerHits.join("; ")}`)
       if (verbose) {
         lines.push(`  plugin dir: ${PLUGIN_DIR}`)
@@ -443,6 +492,27 @@ export default Plugin.define({
             output = JSON.stringify(event.result ?? "")
           }
         }
+
+        // A session whose tool registry was built before this plugin loaded
+        // cannot call ctx tools. Warn once per session and tell that session to
+        // stop trying, rather than letting it burn turns on failed calls.
+        try {
+          const stale = output.match(STALE_REGISTRY_ERROR)
+          if (stale) {
+            routingState.missingToolCalls += 1
+            routingState.lastMissingTool = stale[1]
+            if (!routingState.staleSessions.has(event.sessionID)) {
+              routingState.staleSessions.add(event.sessionID)
+              warn(
+                `Detected active session ${event.sessionID} without ctx tools ` +
+                `(last call: ${stale[1]}). Run "opencode service restart" or create a new session.`
+              )
+            }
+          }
+        } catch {
+          // Detection is observational only; never break the turn over it.
+        }
+
         await hooks["tool.execute.after"](
           { tool: event.tool, sessionID: event.sessionID, args: event.input },
           { output },
@@ -481,35 +551,47 @@ export default Plugin.define({
     // ── system.transform: routing block + resume snapshot injection ─────
     if (hooks["experimental.chat.system.transform"]) {
       await ctx.session.hook("context", async (event) => {
-        const system = Array.isArray(event.system) ? event.system : []
-        const strings = system.map((part) => part?.text ?? "")
-        const markerQuorum =
-          typeof adapterMod.systemHasRoutingInstructions === "function" &&
-          adapterMod.systemHasRoutingInstructions(strings)
-        await hooks["experimental.chat.system.transform"](
-          { sessionID: event.sessionID },
-          { system: strings },
-        )
-        if (strings.some((text) => text.includes("<context_window_protection>"))) {
-          routingState.injected = true
-          routingState.sessions.add(event.sessionID)
-        } else if (ROUTING_RULE_MARKERS.some((marker) => strings.join("\n").includes(marker))) {
-          routingState.skipped = true
-        } else if (wrapperRoutingBlock) {
-          // Adapter skipped injection because the tool catalog tripped its marker
-          // quorum. Splice at index 1 (after the header) for the same cache-fold
-          // reason the adapter uses.
-          try {
+        // Injection is best-effort: a bug here must not break the turn, so the
+        // body is guarded and failures are reported on stderr rather than thrown
+        // into the session.
+        try {
+          const system = Array.isArray(event.system) ? event.system : []
+          const strings = system.map((part) => part?.text ?? "")
+          await hooks["experimental.chat.system.transform"](
+            { sessionID: event.sessionID },
+            { system: strings },
+          )
+          if (strings.some((text) => text.includes("<context_window_protection>"))) {
+            routingState.injected = true
+            routingState.sessions.add(event.sessionID)
+          } else if (ROUTING_RULE_MARKERS.some((marker) => strings.join("\n").includes(marker))) {
+            routingState.skipped = true
+          } else if (wrapperRoutingBlock) {
+            // Adapter skipped injection because the tool catalog tripped its marker
+            // quorum. Splice at index 1 (after the header) for the same cache-fold
+            // reason the adapter uses.
             strings.splice(1, 0, wrapperRoutingBlock)
             routingState.wrapperInjected = true
             routingState.sessions.add(event.sessionID)
-          } catch {
-            // Never break the turn over a routing-block splice failure.
           }
-        }
-        event.system.length = 0
-        for (const text of strings) {
-          event.system.push({ type: "text", text: normalizeRoutingNames(String(text)) })
+          const catalog = inspectCatalog(strings)
+          if (catalog.found) routingState.lastCatalog = catalog
+          if (catalog.found && catalog.visible === 0 && !routingState.staleSessions.has(event.sessionID)) {
+            routingState.staleSessions.add(event.sessionID)
+            warn(
+              `Detected active session ${event.sessionID} without ctx tools in its tool registry. ` +
+              `Run "opencode service restart" or create a new session.`
+            )
+          }
+          if (routingState.staleSessions.has(event.sessionID)) {
+            strings.push(STALE_REGISTRY_NOTE)
+          }
+          event.system.length = 0
+          for (const text of strings) {
+            event.system.push({ type: "text", text: normalizeRoutingNames(String(text)) })
+          }
+        } catch (error) {
+          warn(`routing injection failed for session ${event.sessionID}: ${error.message}`)
         }
       })
     }

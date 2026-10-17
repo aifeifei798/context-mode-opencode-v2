@@ -103,12 +103,14 @@ ctx_routing({ verbose: true })
 
 ```
 Routing status
-  context-mode 1.0.169 · wrapper 1.2.0
+  context-mode 1.0.169 · wrapper 1.3.0
   ctx tools registered: 11 (ctx_execute, ctx_search, ...)
   PreToolUse enforcement: 2 decision(s) observed (modify 2, context 0, deny 0)
   routing block: injected by wrapper — adapter skipped it because the tool catalog tripped its marker quorum
   project rules: AGENTS.md: 0 routing marker(s)
 ```
+
+If a session in this process has a stale tool registry, the report also prints a `stale tool registry:` line — see [Troubleshooting](#troubleshooting).
 
 Turn the wrapper-side injection off with `"options": { "routingBlock": false }` or `CONTEXT_MODE_ROUTING_BLOCK=0`. If you do copy `configs/opencode/AGENTS.md` into your project, the wrapper sees the real rules and does not duplicate them.
 
@@ -228,7 +230,22 @@ OpenCode builds a session's tool registry when the session is loaded into a serv
 Two things to know:
 
 - Indexed events are **not** proof the tools are callable. The hooks (event capture, resume snapshot) can run normally while the tool registry is stale, so `~/.config/opencode/context-mode/sessions/<session>.db` will happily show hundreds of captured events with zero working ctx calls.
-- The wrapper cannot detect this. `ctx.session.hook("context")` receives an `event.tools` map that only contains OpenCode's built-in tools, not plugin-registered ones, so there is no per-session signal to skip routing injection on.
+- `ctx.session.hook("context")` receives an `event.tools` map that only contains OpenCode's built-in tools, not plugin-registered ones, so that map is not a usable per-session signal.
+
+The wrapper detects the stale registry two ways and warns once per session:
+
+1. **Tool catalog check.** The harness renders the Code Mode tool catalog from the session's own registry. If that catalog lists built-ins but none of the registered ctx tools, the wrapper prints a highlighted warning to stderr:
+
+   ```
+   [context-mode-v2] Detected active session ses_… without ctx tools in its tool registry. Run "opencode service restart" or create a new session.
+   ```
+
+   and appends a short `<context_mode_stale_registry>` note to that session's system prompt so the model stops burning turns on calls that cannot resolve.
+2. **Failed-call check.** Any tool result containing `No tool named "ctx_*" is currently available` is counted, warned about, and surfaced by `ctx_routing`:
+
+   ```
+   stale tool registry: 1 session(s) in this process cannot call ctx tools (last failed call: ctx_execute, 4 failure(s)) — run "opencode service restart" or start a new session
+   ```
 
 Fix: start a new session, or restart the service so the old session is reloaded into a process that has the plugin:
 
@@ -236,7 +253,19 @@ Fix: start a new session, or restart the service so the old session is reloaded 
 opencode service restart
 ```
 
-Verified on a session that had four failed ctx calls: after reload, `ctx_stats` returns and the PreToolUse `curl`/`wget` rewrite fires in the same session.
+Verified on a session that had four failed ctx calls: after reload, `ctx_stats` returns, the PreToolUse `curl`/`wget` rewrite fires in the same session, and no stale-registry warning is printed.
+
+### SQLite concurrency
+
+No action needed. Upstream opens every session database with `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, `PRAGMA busy_timeout = 30000`, and wraps writes in `withRetry()` (exponential backoff on `SQLITE_BUSY` / `database is locked`, `[100, 500, 2000]` ms). Confirmed on live session DBs:
+
+```bash
+sqlite3 ~/.config/opencode/context-mode/sessions/<session>.db 'PRAGMA journal_mode; PRAGMA busy_timeout;'
+# wal
+# 30000
+```
+
+Concurrent agents in the same process share those DBs safely; the `*-wal` / `*-shm` side files in `~/.config/opencode/context-mode/sessions/` are the WAL mode in action.
 
 ## Caveats
 

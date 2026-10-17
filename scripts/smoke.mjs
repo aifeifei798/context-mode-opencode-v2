@@ -135,18 +135,77 @@ if (beforeHook) {
   console.log("curl redirect rewritten:", redirectOk)
 }
 
+// ── stale tool registry detection ───────────────────────────────────────────
+// A session created before the plugin registered its tools keeps the old
+// registry; Code Mode surfaces that as a per-call error. The wrapper must warn
+// and stop that session from retrying.
+let staleOk = false
+const afterHook = handlers["tool.execute.after"]
+const staleSession = "ses_smoke_stale"
+if (afterHook && contextHook) {
+  await afterHook({
+    tool: "execute",
+    sessionID: staleSession,
+    input: { code: "tools.ctx_execute({ code: 'console.log(1)' })" },
+    status: "completed",
+    result: {
+      content: [
+        {
+          type: "text",
+          text: 'No tool named "ctx_execute" is currently available. Please use a tool from the available tool list.',
+        },
+      ],
+    },
+  })
+  const noteEvent = { sessionID: staleSession, system: [{ type: "text", text: "You are an assistant." }] }
+  await contextHook(noteEvent)
+  const noteJoined = noteEvent.system.map((p) => p.text).join("\n")
+  staleOk = noteJoined.includes("<context_mode_stale_registry>")
+  console.log("stale registry note injected for that session:", staleOk)
+
+  // Proactive signal: the harness renders the Code Mode catalog from the
+  // session's registry, so a stale registry lists built-ins only.
+  let catalogStaleOk = false
+  let healthyOk = false
+  if (contextHook) {
+    const staleCatalogEvent = {
+      sessionID: "ses_smoke_stale_catalog",
+      system: [
+        { type: "text", text: "You are an assistant." },
+        { type: "text", text: "## Available tools\n- read (1 tool)\n- shell (1 tool)\n- edit (1 tool)" },
+      ],
+    }
+    await contextHook(staleCatalogEvent)
+    catalogStaleOk = staleCatalogEvent.system.map((p) => p.text).join("\n").includes("<context_mode_stale_registry>")
+
+    const healthyEvent = {
+      sessionID: "ses_smoke_healthy",
+      system: [
+        { type: "text", text: "You are an assistant." },
+        { type: "text", text: "## Available tools\n- read (1 tool)\n- shell (1 tool)\n- ctx_execute (1 tool)" },
+      ],
+    }
+    await contextHook(healthyEvent)
+    healthyOk = !healthyEvent.system.map((p) => p.text).join("\n").includes("<context_mode_stale_registry>")
+  }
+  staleOk = staleOk && catalogStaleOk && healthyOk
+  console.log("stale registry detected from tool catalog:", catalogStaleOk, "| healthy session not flagged:", healthyOk)
+}
+
 // ── ctx_routing report ─────────────────────────────────────────────────────
 let reportOk = false
+let reportText = ""
 const routing = tools.find((t) => t.name === "ctx_routing")
 if (routing) {
   const out = await routing.execute({ verbose: true }, { sessionID: "ses_smoke_routing", directory: PLUGIN_DIR })
-  reportOk = String(out.content).startsWith("Routing status")
-  console.log("ctx_routing output:\n" + String(out.content))
+  reportText = String(out.content)
+  reportOk = reportText.startsWith("Routing status") && reportText.includes("stale tool registry")
+  console.log("ctx_routing output:\n" + reportText)
 }
 
 if (createdStub) rmSync(stubDir, { recursive: true, force: true })
 
-if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk) {
+if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk || !staleOk) {
   console.error(
     "FAILED:",
     missing.length ? "missing tools " + missing.join(",") : "",
@@ -156,6 +215,7 @@ if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk |
     !namingOk ? "routing guidance not normalized" : "",
     !redirectOk ? "PreToolUse redirect not normalized" : "",
     !reportOk ? "ctx_routing report malformed" : "",
+    !staleOk ? "stale tool registry not detected" : "",
   )
   process.exit(1)
 }
