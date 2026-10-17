@@ -43,6 +43,7 @@ Gotchas specific to routing:
 - `registeredNames` must stay a **live** `Set` populated inside the `ctx.tool.transform` callback. Snapshotting it with `new Set(registeredCtxTools)` at setup time is empty, because OpenCode invokes the transform callback lazily — normalization then silently no-ops.
 - The routing block is built with an identity tool namer (`(bare) => bare`). If tools ever get prefixed names, pass a namer that maps to the registered names instead.
 - `routingState` is module-level, so counters are per process, not per session; `sessions` is a `Set` of session IDs that saw the block.
+- A session created before the plugin registered its ctx tools keeps a stale tool registry until it is reloaded: the routing block still reaches its system prompt (injection is per-request), but every `ctx_*` call fails with `No tool named ... is currently available`. There is no per-session signal to guard against this — `ctx.session.hook("context")`'s `event.tools` lists only OpenCode's built-in tools, not plugin-registered ones (verified empirically). Do not build an injection guard on it.
 
 ## Dependencies / setup
 

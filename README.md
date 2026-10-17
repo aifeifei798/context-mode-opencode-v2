@@ -219,6 +219,25 @@ await tools.ctx_stats()
 
 Rollback: delete the `plugins` entry from `opencode.json` and move the backup copy back into `~/.config/opencode/plugins/`.
 
+## Troubleshooting
+
+### `No tool named "ctx_batch_execute" is currently available`
+
+OpenCode builds a session's tool registry when the session is loaded into a server process. A session that was created **before** the plugin registered its ctx tools keeps the old registry until it is reloaded. The routing rules are injected per request, so they still reach that session's system prompt — the model dutifully calls `ctx_*` and every call fails.
+
+Two things to know:
+
+- Indexed events are **not** proof the tools are callable. The hooks (event capture, resume snapshot) can run normally while the tool registry is stale, so `~/.config/opencode/context-mode/sessions/<session>.db` will happily show hundreds of captured events with zero working ctx calls.
+- The wrapper cannot detect this. `ctx.session.hook("context")` receives an `event.tools` map that only contains OpenCode's built-in tools, not plugin-registered ones, so there is no per-session signal to skip routing injection on.
+
+Fix: start a new session, or restart the service so the old session is reloaded into a process that has the plugin:
+
+```bash
+opencode service restart
+```
+
+Verified on a session that had four failed ctx calls: after reload, `ctx_stats` returns and the PreToolUse `curl`/`wget` rewrite fires in the same session.
+
 ## Caveats
 
 - The wrapper is tested against context-mode **1.0.169** and declares it with a caret range. If upstream changes the adapter export shape (`server` / `ContextModePlugin`) or hook names, the wrapper throws with an actionable message rather than silently loading nothing.
