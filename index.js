@@ -241,6 +241,56 @@ const STALE_REGISTRY_NOTE =
   "or start a new session; until then do not call ctx_* tools.\n" +
   "</context_mode_stale_registry>"
 
+// OpenCode's compaction reducer only trims messages — the system parts of the
+// compaction request (base prompt, tool catalog, routing block, and the resume
+// snapshot injected by the compaction hook) are never reduced. When the
+// injected snapshot is larger than the compaction budget (model context limit
+// minus the compaction buffer), the reducer cannot fit even one exchange and
+// the step fails with "The compaction request cannot be reduced further without
+// losing the latest exchange or checkpoint". The snapshot is a table of
+// contents — full detail lives in the context-mode DB and is reachable via
+// ctx_search — so it is safe to shrink it here.
+const DEFAULT_SNAPSHOT_CHAR_CAP = 12000
+
+function capCompactionContext(text, cap) {
+  if (cap <= 0 || text.length <= cap) return text
+  // The <errors> section is the usual bloat: every stored traceback is inlined
+  // verbatim. Replace it with a deduplicated digest of the exception lines
+  // (e.g. "ModuleNotFoundError: No module named 'sqlalchemy'"); ctx_search
+  // retrieves the full tracebacks from the session DB.
+  const shrunk = text.replace(
+    /<errors count="(\d+)">([\s\S]*?)<\/errors>/,
+    (_match, count, body) => {
+      const [entries, toolCall = ""] = body.split("    For full details:")
+      const seen = new Set()
+      const lines = []
+      for (const line of entries.split("\n")) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        if (
+          /^[A-Za-z_][A-Za-z_.]*(?:Error|Exception|Warning):/.test(trimmed) ||
+          /^Exited with code \d+$/.test(trimmed)
+        ) {
+          if (!seen.has(trimmed)) {
+            seen.add(trimmed)
+            lines.push(`    ${trimmed}`)
+          }
+        }
+      }
+      return (
+        `<errors count="${count}">\n${lines.join("\n")}\n` +
+        (toolCall ? `    For full details:${toolCall}\n` : "") +
+        "  </errors>"
+      )
+    },
+  )
+  if (shrunk.length <= cap) return shrunk
+  return (
+    shrunk.slice(0, cap) +
+    "\n[resume snapshot truncated — full session history is indexed; use ctx_search(queries: [...], source: \"session-events\") for details]"
+  )
+}
+
 function warn(message) {
   process.stderr.write(`\x1b[33m[context-mode-v2] ${message}\x1b[0m\n`)
 }
@@ -272,6 +322,11 @@ export default Plugin.define({
     const directory = ctx.location?.directory ?? process.cwd()
 
     // The v1 factory expects { directory, client: { app: { log } } }.
+    const snapshotCap = Number(
+      ctx.options?.compactionSnapshotChars ??
+        process.env.CONTEXT_MODE_COMPACTION_SNAPSHOT_CHARS ??
+        DEFAULT_SNAPSHOT_CHAR_CAP,
+    )
     const hooks = await createContextModePlugin({
       directory,
       client: {
@@ -542,8 +597,19 @@ export default Plugin.define({
         )
         // v1 appended snapshots to the compaction prompt via output.context;
         // in v2 the compaction request's system parts serve the same purpose.
+        // Cap the injected text: OpenCode's reducer trims messages only, so an
+        // oversized system part makes the request irreducible (see
+        // capCompactionContext above).
         for (const text of output.context) {
-          if (text) event.system.push({ type: "text", text: String(text) })
+          if (!text) continue
+          const capped = capCompactionContext(String(text), snapshotCap)
+          if (capped.length !== String(text).length) {
+            warn(
+              `capped compaction snapshot from ${String(text).length} to ` +
+                `${capped.length} chars (compactionSnapshotChars: 0 disables)`
+            )
+          }
+          event.system.push({ type: "text", text: capped })
         }
       })
     }
@@ -588,7 +654,14 @@ export default Plugin.define({
           }
           event.system.length = 0
           for (const text of strings) {
-            event.system.push({ type: "text", text: normalizeRoutingNames(String(text)) })
+            const t = String(text)
+            // The adapter splices the resume snapshot into the system parts;
+            // cap it the same way as the compaction injection so a bloated
+            // <errors> section cannot blow the context window on resume.
+            const capped = t.startsWith("<session_resume")
+              ? capCompactionContext(t, snapshotCap)
+              : t
+            event.system.push({ type: "text", text: normalizeRoutingNames(capped) })
           }
         } catch (error) {
           warn(`routing injection failed for session ${event.sessionID}: ${error.message}`)
