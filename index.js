@@ -482,8 +482,18 @@ export default Plugin.define({
               sessionID: toolCtx.sessionID,
               directory,
             })
+            let content = String(result?.output ?? "")
+            // ctx_stats ends with the upstream engine version. OpenCode has no
+            // place to show a local plugin's own version (`plugin list` prints
+            // "local" for every path-loaded plugin — Plugin.Info carries a
+            // version only for package sources), so stamp the wrapper version
+            // onto the stats footer where it is actually visible.
+            const wrapper = wrapperVersion()
+            if (name === "ctx_stats" && wrapper && !content.includes(`wrapper v${wrapper}`)) {
+              content += `${content.endsWith("\n") || !content ? "" : "\n"}wrapper v${wrapper}\n`
+            }
             return {
-              content: String(result?.output ?? ""),
+              content,
               metadata: { title: result?.title ?? name },
             }
           },

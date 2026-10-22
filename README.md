@@ -105,7 +105,7 @@ ctx_routing({ verbose: true })
 
 ```
 Routing status
-  context-mode 1.0.169 · wrapper 1.3.1
+  context-mode 1.0.169 · wrapper 1.3.2
   ctx tools registered: 11 (ctx_execute, ctx_search, ...)
   PreToolUse enforcement: 2 decision(s) observed (modify 2, context 0, deny 0)
   PreToolUse readiness: sentinel active (/tmp/context-mode-mcp-ready-12345)
@@ -155,7 +155,7 @@ Before releasing, run the offline smoke test (no OpenCode process required):
 
 ```bash
 npm run check    # node --check index.js
-npm run smoke    # stubs @opencode/plugin, calls setup(), asserts the 11 ctx tools + ctx_routing and the routing hooks
+npm run smoke    # stubs @opencode/plugin, calls setup(), asserts the 11 ctx tools + ctx_routing, the routing hooks, the MCP readiness sentinel, and the ctx_stats version stamp
 ```
 
 ## How OpenCode discovers the plugin
@@ -194,12 +194,11 @@ npm install
 npm run reload   # node --check + smoke test + opencode service restart
 ```
 
-Reload behaviour (verified on OpenCode v2.0.30):
+Reload behaviour (verified on OpenCode v2.0.30, re-checked on v2.1.2):
 
 - Changes under watched config directories (`~/.config/opencode/`, `.opencode/`) reload automatically.
-- A local plugin directory outside those watched directories is **not** watched — editing `index.js` in the checkout does **not** hot-reload the running server (confirmed: the live session kept the old code until `opencode service restart`).
+- A local plugin directory outside those watched directories is **not** watched: editing `index.js` in the checkout does not apply to the running process by itself. The server reloads its plugin set when it is asked to enumerate plugins — `opencode plugin list` was enough on v2.1.2 (verified: a probe line added to `ctx_routing` stayed invisible until the command ran), and `opencode service restart` always works.
 - `npm run reload` is the one-liner for the edit → verify → restart loop.
-- Verified on OpenCode v2.0.30 with context-mode 1.0.169.
 - `@opencode/plugin` is provided by OpenCode's plugin runtime; it is intentionally not a dependency of this package.
 
 ## Verify
@@ -209,6 +208,15 @@ opencode plugin list
 # ID               VERSION  SOURCE
 # context-mode.v2  local    /absolute/path/to/context-mode-opencode-v2/index.js
 ```
+
+`VERSION` says `local` for every path-loaded plugin — OpenCode's `Plugin.Info` only carries a version for `package` sources (`packages/schema/src/plugin.ts`), and `Plugin.define` has no version field. The wrapper's own version therefore lives where it is actually visible:
+
+```js
+await tools.ctx_stats()      // footer: "v1.0.169" (upstream) + "wrapper v1.3.2"
+await tools.ctx_routing()    // header: "context-mode 1.0.169 · wrapper 1.3.2"
+```
+
+Only a package install (`opencode plugin add github:...` or npm) would populate the `VERSION` column, at the cost of the hot-edit loop.
 
 The server log should show the plugin being loaded without errors:
 

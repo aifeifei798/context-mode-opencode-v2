@@ -105,9 +105,13 @@ console.log("hooks registered:", hooks.join(", "))
 console.log("schema objects:", tools.length - badSchemas.length, "/", tools.length)
 
 const stats = tools.find((t) => t.name === "ctx_stats")
+let statsVersionOk = false
 if (stats) {
   const out = await stats.execute({}, { sessionID: "ses_smoke", directory: PLUGIN_DIR })
-  console.log("ctx_stats output:", String(out.content).slice(0, 120).replace(/\n/g, " "))
+  const statsText = String(out.content)
+  statsVersionOk = /wrapper v\d+\.\d+\.\d+/.test(statsText)
+  console.log("ctx_stats output:", statsText.slice(0, 120).replace(/\n/g, " "))
+  console.log("ctx_stats carries wrapper version:", statsVersionOk)
   console.log("ctx_stats metadata:", JSON.stringify(out.metadata))
 }
 
@@ -229,7 +233,7 @@ if (typeof cleanup === "function") cleanup()
 if (createdStub) rmSync(stubDir, { recursive: true, force: true })
 rmSync(sentinelDir, { recursive: true, force: true })
 
-if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk || !staleOk) {
+if (missing.length || badSchemas.length || !statsVersionOk || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk || !staleOk) {
   console.error(
     "FAILED:",
     missing.length ? "missing tools " + missing.join(",") : "",
@@ -237,6 +241,7 @@ if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk |
     !injectionOk ? "routing block not injected" : "",
     !wrapperInjectionOk ? "wrapper did not supply routing rules when adapter skipped" : "",
     !namingOk ? "routing guidance not normalized" : "",
+    !statsVersionOk ? "ctx_stats does not report the wrapper version" : "",
     !sentinelOk ? "MCP readiness sentinel not written (PreToolUse redirects stay disabled)" : "",
     !redirectOk ? "PreToolUse redirect not normalized" : "",
     !reportOk ? "ctx_routing report malformed" : "",
