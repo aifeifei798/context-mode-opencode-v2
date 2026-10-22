@@ -16,6 +16,14 @@ const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)))
 const stubDir = join(PLUGIN_DIR, "node_modules", "@opencode", "plugin")
 const createdStub = !existsSync(join(stubDir, "index.js"))
 
+// Isolate the MCP readiness sentinel. The wrapper writes
+// `<dir>/context-mode-mcp-ready-<pid>` at setup so upstream's isMCPReady()
+// gate opens; pointing it at a scratch dir keeps the test deterministic and
+// leaves no markers in the host's /tmp.
+const sentinelDir = join(PLUGIN_DIR, "node_modules", ".smoke-sentinel")
+process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = sentinelDir
+rmSync(sentinelDir, { recursive: true, force: true })
+
 if (createdStub) {
   mkdirSync(stubDir, { recursive: true })
   writeFileSync(join(stubDir, "package.json"), JSON.stringify({ name: "@opencode/plugin", version: "0.0.0-stub", type: "module", main: "index.js", exports: "./index.js" }) + "\n")
@@ -50,18 +58,28 @@ const ctx = {
   },
   event: {
     subscribe: ({ signal }) => ({
-      [Symbol.asyncIterator]: () => ({
-        next: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 300))
-          return signal?.aborted ? { done: true, value: undefined } : { done: false, value: { type: "other" } }
-        },
-      }),
+      [Symbol.asyncIterator]: () => {
+        // Finite: one foreign event, then done. The real loop runs until
+        // cleanup aborts it; a never-ending stub would keep this test alive
+        // after the assertions (cleanup now runs at the end, not right after
+        // setup, so the readiness sentinel is still present for the
+        // PreToolUse assertion).
+        let emitted = false
+        return {
+          next: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 300))
+            if (signal?.aborted) return { done: true, value: undefined }
+            if (emitted) return { done: true, value: undefined }
+            emitted = true
+            return { done: false, value: { type: "other" } }
+          },
+        }
+      },
     }),
   },
 }
 
 const cleanup = await mod.default.setup(ctx)
-if (typeof cleanup === "function") cleanup()
 
 const expectedTools = [
   "ctx_execute",
@@ -126,6 +144,7 @@ if (contextHook) {
 
 // ── PreToolUse enforcement + normalization ────────────────────────────────
 let redirectOk = false
+let sentinelOk = false
 const beforeHook = handlers["tool.execute.before"]
 if (beforeHook) {
   const event = { tool: "shell", sessionID: "ses_smoke_routing", input: { command: "curl -s https://example.com" } }
@@ -133,6 +152,8 @@ if (beforeHook) {
   const rewritten = String(event.input.command ?? "")
   redirectOk = rewritten.includes("redirected") && rewritten.includes("ctx_execute") && !rewritten.includes("context-mode_ctx_")
   console.log("curl redirect rewritten:", redirectOk)
+  sentinelOk = existsSync(join(sentinelDir, `context-mode-mcp-ready-${process.pid}`))
+  console.log("readiness sentinel:", sentinelOk)
 }
 
 // ── stale tool registry detection ───────────────────────────────────────────
@@ -203,7 +224,10 @@ if (routing) {
   console.log("ctx_routing output:\n" + reportText)
 }
 
+if (typeof cleanup === "function") cleanup()
+
 if (createdStub) rmSync(stubDir, { recursive: true, force: true })
+rmSync(sentinelDir, { recursive: true, force: true })
 
 if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk || !staleOk) {
   console.error(
@@ -213,6 +237,7 @@ if (missing.length || badSchemas.length || !injectionOk || !wrapperInjectionOk |
     !injectionOk ? "routing block not injected" : "",
     !wrapperInjectionOk ? "wrapper did not supply routing rules when adapter skipped" : "",
     !namingOk ? "routing guidance not normalized" : "",
+    !sentinelOk ? "MCP readiness sentinel not written (PreToolUse redirects stay disabled)" : "",
     !redirectOk ? "PreToolUse redirect not normalized" : "",
     !reportOk ? "ctx_routing report malformed" : "",
     !staleOk ? "stale tool registry not detected" : "",

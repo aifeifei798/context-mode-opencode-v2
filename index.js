@@ -17,7 +17,8 @@ import { Plugin } from "@opencode/plugin"
 import { spawn, spawnSync } from "node:child_process"
 import { dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const CONTEXT_MODE_DIR = join(PLUGIN_DIR, "node_modules", "context-mode")
@@ -295,6 +296,78 @@ function warn(message) {
   process.stderr.write(`\x1b[33m[context-mode-v2] ${message}\x1b[0m\n`)
 }
 
+// ── MCP readiness sentinel ──────────────────────────────────────────────
+// Upstream gates every PreToolUse rewrite (curl/wget, inline HTTP, webfetch,
+// read, build) behind `isMCPReady()` in `hooks/core/mcp-ready.mjs`: it scans
+// `<tmp>/context-mode-mcp-ready-*` for a live PID, or a sentinel whose mtime is
+// younger than 90s, and `mcpRedirect()` returns null when the check fails.
+// Only the MCP server process ever wrote that sentinel. On OpenCode v2 the ctx
+// tools are registered natively in this process and no MCP server runs, so the
+// check was always false and routing enforcement silently no-op'd (the symptom
+// is `curl redirect rewritten: false` in the smoke test plus
+// `PreToolUse enforcement: 0 decision(s)`). Write the sentinel for our own PID
+// and refresh it on upstream's 30s cadence.
+const SENTINEL_PREFIX = "context-mode-mcp-ready-"
+const SENTINEL_REFRESH_MS = 30_000
+
+function sentinelDirectory() {
+  const override = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR
+  if (override && override.length > 0) return override
+  return process.platform === "win32" ? tmpdir() : "/tmp"
+}
+
+// One sentinel per process, shared by every setup() call: OpenCode can load the
+// plugin more than once (reload, several sessions), and the PID is the same.
+// Refcounted so the first cleanup does not delete a marker a sibling setup
+// still relies on.
+let sentinelState = null
+
+/**
+ * Never throws: a read-only /tmp must degrade to "redirects disabled" rather
+ * than block plugin setup.
+ */
+function startMcpReadySentinel() {
+  if (!sentinelState) {
+    const directory = sentinelDirectory()
+    const path = join(directory, `${SENTINEL_PREFIX}${process.pid}`)
+    const touch = () => {
+      try {
+        mkdirSync(directory, { recursive: true })
+        writeFileSync(path, String(process.pid))
+        return true
+      } catch {
+        return false
+      }
+    }
+    const ready = touch()
+    const timer = ready ? setInterval(touch, SENTINEL_REFRESH_MS) : null
+    // The sentinel must not keep the host process alive.
+    if (timer && typeof timer.unref === "function") timer.unref()
+    sentinelState = { ready, path, timer, refs: 0 }
+  }
+
+  const state = sentinelState
+  state.refs += 1
+  let released = false
+  return {
+    ready: state.ready,
+    path: state.path,
+    stop: () => {
+      if (released) return
+      released = true
+      state.refs -= 1
+      if (state.refs > 0) return
+      if (state.timer) clearInterval(state.timer)
+      try {
+        unlinkSync(state.path)
+      } catch {
+        // Best effort: a stale sentinel is reclaimed by upstream's PID probe.
+      }
+      if (sentinelState === state) sentinelState = null
+    },
+  }
+}
+
 export default Plugin.define({
   id: "context-mode.v2",
   async setup(ctx) {
@@ -307,6 +380,18 @@ export default Plugin.define({
     }
 
     scheduleContextModeUpdate(ctx, ctx.options?.autoUpdate !== false && process.env.CONTEXT_MODE_AUTO_UPDATE !== "0")
+
+    // Started before the adapter is asked for hooks, so the very first tool call
+    // can already be routed. No MCP server runs under OpenCode v2, so nothing
+    // else writes this sentinel.
+    const sentinel = startMcpReadySentinel()
+    if (!sentinel.ready) {
+      warn(
+        `could not write the context-mode readiness sentinel (${sentinel.path}); ` +
+          "PreToolUse redirects stay disabled — set CONTEXT_MODE_MCP_SENTINEL_DIR to a writable directory",
+      )
+    }
+    const cleanups = [() => sentinel.stop()]
 
     const adapterMod = await import("context-mode/plugin")
     const createContextModePlugin = adapterMod.server ?? adapterMod.ContextModePlugin
@@ -477,6 +562,11 @@ export default Plugin.define({
         `  ctx tools registered: ${registeredCtxTools.length} (${registeredCtxTools.join(", ")})`,
         `  tool naming: bare ctx_* — upstream's context-mode_* guidance names are normalized to the registered names`,
         `  PreToolUse enforcement: ${routingState.modify + routingState.context + routingState.deny} decision(s) observed (modify ${routingState.modify}, context ${routingState.context}, deny ${routingState.deny})`,
+        `  PreToolUse readiness: ${
+          sentinel.ready
+            ? `sentinel active (${sentinel.path})`
+            : `no sentinel at ${sentinel.path} — upstream isMCPReady() is false, so every redirect is skipped`
+        }`,
         `  routing block: ${blockStatus}`,
       ]
       if (routingState.lastCatalog) {
@@ -687,7 +777,11 @@ export default Plugin.define({
           }
         }
       })()
-      return () => controller.abort()
+      cleanups.push(() => controller.abort())
+    }
+
+    return () => {
+      for (const cleanup of cleanups) cleanup()
     }
   },
 })

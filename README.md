@@ -11,7 +11,7 @@ Plugin must export a default definition with an id and an effect or setup functi
 This wrapper calls the upstream adapter factory and re-registers everything on the v2 API:
 
 - **ctx_\* tools** (`ctx_batch_execute`, `ctx_search`, `ctx_execute`, `ctx_stats`, ...) registered natively via `ctx.tool.transform`, with input schemas derived from the upstream zod v3 schemas converted to JSON Schema (zod v4 `toJSONSchema`).
-- **PreToolUse routing enforcement** (`tool.execute.before`) via `ctx.tool.hook("execute.before")`.
+- **PreToolUse routing enforcement** (`tool.execute.before`) via `ctx.tool.hook("execute.before")`, plus the MCP readiness sentinel upstream requires before any redirect fires (see below).
 - **PostToolUse session event capture** (`tool.execute.after`) via `ctx.tool.hook("execute.after")`.
 - **User prompt capture** (`chat.message`) via `ctx.session.hook("prompt")`.
 - **PreCompact resume snapshot** (`experimental.session.compacting`) via `ctx.session.hook("compaction")`.
@@ -95,6 +95,8 @@ Two things the wrapper fixes around that injection:
 1. **Marker false positive.** The adapter skips injection when the system prompt already contains a quorum of `ROUTING_MARKERS` (`<context_window_protection>`, `ctx_search`, `ctx_index`). Harnesses that merely *list* ctx tool names in the tool catalog (Code Mode, MCP tool listings) trip that check, so the rules never reach the prompt even though no rules are present. The wrapper detects this and injects the upstream routing block itself, built from `context-mode/hooks/routing-block.mjs` with the tool names actually registered.
 2. **Tool-name mismatch.** Upstream guidance text uses the MCP-style OpenCode convention (`context-mode_ctx_execute`), but native plugin tools are registered bare (`ctx_execute`). The wrapper rewrites guidance to the registered names, so the model is pointed at tools that exist.
 
+That enforcement is gated upstream: `mcpRedirect()` returns `null` unless `isMCPReady()` finds a live `context-mode-mcp-ready-<pid>` sentinel in `/tmp` (or one touched within 90 s), and only the MCP server ever wrote it. Under OpenCode v2 the ctx tools are native plugin tools and no MCP server runs, so the gate was permanently closed and every redirect silently no-op'd. The wrapper writes the sentinel for its own PID at setup and refreshes it every 30 s; `ctx_routing` reports the result as `PreToolUse readiness: sentinel active (<path>)`. Override the directory with `CONTEXT_MODE_MCP_SENTINEL_DIR` if `/tmp` is not writable — otherwise setup warns and runs with redirects disabled.
+
 Check what is actually active:
 
 ```
@@ -103,9 +105,10 @@ ctx_routing({ verbose: true })
 
 ```
 Routing status
-  context-mode 1.0.169 · wrapper 1.3.0
+  context-mode 1.0.169 · wrapper 1.3.1
   ctx tools registered: 11 (ctx_execute, ctx_search, ...)
   PreToolUse enforcement: 2 decision(s) observed (modify 2, context 0, deny 0)
+  PreToolUse readiness: sentinel active (/tmp/context-mode-mcp-ready-12345)
   routing block: injected by wrapper — adapter skipped it because the tool catalog tripped its marker quorum
   project rules: AGENTS.md: 0 routing marker(s)
 ```
@@ -253,7 +256,28 @@ Fix: start a new session, or restart the service so the old session is reloaded 
 opencode service restart
 ```
 
-Verified on a session that had four failed ctx calls: after reload, `ctx_stats` returns, the PreToolUse `curl`/`wget` rewrite fires in the same session, and no stale-registry warning is printed.
+Verified on a session that had four failed ctx calls: after reload, `ctx_stats` returns, the PreToolUse `curl`/`wget` rewrite fires in the same session (see `PreToolUse readiness` in `ctx_routing`), and no stale-registry warning is printed.
+
+### PreToolUse redirects never fire (`curl` runs untouched)
+
+Symptom: `curl`/`wget`/inline-HTTP commands run as-is, `ctx_routing` shows `PreToolUse enforcement: 0 decision(s)`, and the smoke test fails with `curl redirect rewritten: false`.
+
+Cause: upstream only rewrites commands when `isMCPReady()` is true, which means a live `context-mode-mcp-ready-<pid>` file in `/tmp`. Every redirect was written for the MCP server deployment; a native-plugin deployment has no MCP server. The wrapper writes that sentinel itself, so this should only happen when the write failed — `/tmp` read-only, or a sandbox with an unusual tmp root.
+
+Check and fix:
+
+```
+ctx_routing({ verbose: true })     # look at "PreToolUse readiness"
+ls -la /tmp/context-mode-mcp-ready-*   # pid must be the OpenCode service process
+```
+
+If the report says the sentinel is missing, point it at a writable directory:
+
+```bash
+CONTEXT_MODE_MCP_SENTINEL_DIR=~/.cache/context-mode opencode service restart
+```
+
+Do **not** hand-create a sentinel for a dead PID and expect it to stick: upstream probes the PID and deletes markers older than 90 s that it cannot see.
 
 ### SQLite concurrency
 
