@@ -235,6 +235,12 @@ const routingState = {
   lastAfterTool: null,
   afterErrors: 0,
   lastAfterError: null,
+  // Direct ctx-call observability: whether a native (non-Code-Mode) ctx_* call
+  // reached the wrapper closure at all, and what context it arrived with.
+  nativeCtxCalls: 0,
+  lastNativeCtx: null,
+  ctxExecErrors: 0,
+  lastCtxExecError: null,
 }
 
 // OpenCode does not hot-reload a session's tool registry, so a session created
@@ -491,12 +497,26 @@ export default Plugin.define({
           description: tool.description || name,
           input: z.toJSONSchema(z.object(shape), { io: "input" }),
           execute: async (input, toolCtx) => {
+            // Observability for direct native ctx_* calls: record arrival, the
+            // context handed by the harness, and any upstream error. A call that
+            // never increments these counters was stalled before dispatch — a
+            // harness bug, not a plugin bug.
+            routingState.nativeCtxCalls += 1
+            routingState.lastNativeCtx = `${name} sessionID=${toolCtx?.sessionID ?? "none"} mode=${toolCtx?.mode ?? "unknown"}`
             // The v1 execute closure re-parses args with the original zod v3
             // schema (applying coercions/defaults) and returns { title, output }.
-            const result = await tool.execute(input, {
-              sessionID: toolCtx.sessionID,
-              directory,
-            })
+            let result
+            try {
+              result = await tool.execute(input, {
+                sessionID: toolCtx.sessionID,
+                directory,
+              })
+            } catch (error) {
+              routingState.ctxExecErrors += 1
+              routingState.lastCtxExecError = `${name}: ${error?.message ?? String(error)}`
+              warn(`ctx tool ${name} failed: ${routingState.lastCtxExecError}`)
+              throw error
+            }
             let content = String(result?.output ?? "")
             // ctx_stats ends with the upstream engine version. OpenCode has no
             // place to show a local plugin's own version (`plugin list` prints
@@ -604,6 +624,9 @@ export default Plugin.define({
         `  PostToolUse capture: ${routingState.afterCalls} call(s) reached the wrapper${
           routingState.afterErrors ? ` (${routingState.afterErrors} error(s), last: ${routingState.lastAfterError})` : ""
         }${routingState.lastAfterTool ? `, last tool: ${routingState.lastAfterTool}` : ""}`,
+        `  ctx exec: ${routingState.nativeCtxCalls} call(s) reached the wrapper closures${
+          routingState.ctxExecErrors ? ` (${routingState.ctxExecErrors} error(s), last: ${routingState.lastCtxExecError})` : ""
+        }${routingState.lastNativeCtx ? `, last: ${routingState.lastNativeCtx}` : ""}`,
       ]
       if (routingState.lastCatalog) {
         lines.push(
