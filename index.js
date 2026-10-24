@@ -228,6 +228,13 @@ const routingState = {
   missingToolCalls: 0,
   lastMissingTool: null,
   lastCatalog: null,
+  // PostToolUse observability: how many execute.after calls reached the wrapper
+  // and whether upstream capture errored (0 with live tool traffic means the
+  // server never fired the hook for this process).
+  afterCalls: 0,
+  lastAfterTool: null,
+  afterErrors: 0,
+  lastAfterError: null,
 }
 
 // OpenCode does not hot-reload a session's tool registry, so a session created
@@ -594,6 +601,9 @@ export default Plugin.define({
             : `no sentinel at ${sentinel.path} — upstream isMCPReady() is false, so every redirect is skipped`
         }`,
         `  routing block: ${blockStatus}`,
+        `  PostToolUse capture: ${routingState.afterCalls} call(s) reached the wrapper${
+          routingState.afterErrors ? ` (${routingState.afterErrors} error(s), last: ${routingState.lastAfterError})` : ""
+        }${routingState.lastAfterTool ? `, last tool: ${routingState.lastAfterTool}` : ""}`,
       ]
       if (routingState.lastCatalog) {
         lines.push(
@@ -687,7 +697,14 @@ export default Plugin.define({
         await hooks["tool.execute.after"](
           { tool: event.tool, sessionID: event.sessionID, args: event.input },
           { output },
-        )
+        ).then(() => {
+          routingState.afterCalls += 1
+          routingState.lastAfterTool = event.tool
+        }).catch((error) => {
+          routingState.afterErrors += 1
+          routingState.lastAfterError = error?.message ?? String(error)
+          warn(`tool.execute.after capture failed for ${event.tool}: ${routingState.lastAfterError}`)
+        })
       })
     }
 
