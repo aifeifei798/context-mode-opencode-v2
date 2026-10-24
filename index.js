@@ -657,6 +657,11 @@ export default Plugin.define({
     // ── PreToolUse: routing enforcement (deny / modify / passthrough) ───
     if (hooks["tool.execute.before"]) {
       await ctx.tool.hook("execute.before", async (event) => {
+        // NOTE: a rewrite hook for native ctx_* calls was tried and reverted —
+        // direct native ctx_* calls stall in harness dispatch BEFORE this hook
+        // fires (verified: redirect counters stay 0 for the stalled call), so
+        // no plugin-side hook can intercept them. Guidance + AGENTS.md rules
+        // steer the model away from direct calls instead.
         const args = event.input ?? {}
         const commandBefore = typeof args.command === "string" ? args.command : null
         const contextBefore = typeof args.additionalContext === "string"
