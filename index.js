@@ -448,7 +448,15 @@ export default Plugin.define({
         )
         if (existsSync(routingBlockPath)) {
           const { createRoutingBlock } = await import(pathToFileURL(routingBlockPath).href)
-          wrapperRoutingBlock = createRoutingBlock((bare) => bare)
+          // Code Mode resolves ctx_* only through the execute tool's catalog
+          // (`tools.ctx_*`). A direct native ctx_* call is not parsed by the
+          // harness and stalls the turn, so guidance must name the catalog path.
+          wrapperRoutingBlock =
+            createRoutingBlock((bare) => `tools.${bare}`) +
+            "\n  <calling_convention>\n" +
+            "    On OpenCode, ctx_* tools are callable ONLY inside the `execute` tool as `tools.ctx_*(...)`.\n" +
+            "    A direct native ctx_* tool call is not resolved by the harness and stalls the turn.\n" +
+            "  </calling_convention>\n"
         }
       } catch {
         wrapperRoutingBlock = null
@@ -513,6 +521,7 @@ export default Plugin.define({
           metadata: { title: "Routing Status" },
         }),
       })
+      registeredNames.add("ctx_routing")
     })
 
     // Upstream routing text uses the MCP-style OpenCode tool naming
@@ -521,11 +530,18 @@ export default Plugin.define({
     // names the model can actually call. Only rewrite when the bare name is
     // registered, so a future upstream that registers prefixed names is left
     // untouched.
+    // Code Mode resolves ctx tools as `tools.ctx_*` inside `execute`; a direct
+    // bare ctx_* call is not parsed by the harness and stalls the turn, so
+    // guidance names are rewritten to the catalog path.
     function normalizeRoutingNames(text) {
-      if (typeof text !== "string" || !text.includes("context-mode_")) return text
-      return text.replace(/context-mode_([a-z_]+)/g, (match, bare) =>
-        registeredNames.has(bare) ? bare : match,
-      )
+      if (typeof text !== "string" || !text.includes("ctx_")) return text
+      return text
+        .replace(/context-mode_(ctx_[a-z_]+)/g, (match, bare) =>
+          registeredNames.has(bare) ? `tools.${bare}` : match,
+        )
+        .replace(/(?<![\w.])ctx_([a-z_]+)/g, (match, bare) =>
+          registeredNames.has(`ctx_${bare}`) ? `tools.ctx_${bare}` : match,
+        )
     }
 
     // The harness renders the Code Mode tool catalog from the session's own tool
@@ -570,7 +586,7 @@ export default Plugin.define({
         "Routing status",
         `  context-mode ${installedContextModeVersion() ?? "unknown"} · wrapper ${wrapperVersion()}`,
         `  ctx tools registered: ${registeredCtxTools.length} (${registeredCtxTools.join(", ")})`,
-        `  tool naming: bare ctx_* — upstream's context-mode_* guidance names are normalized to the registered names`,
+        `  tool naming: tools.ctx_* via Code Mode execute — direct native ctx_* calls stall the turn; upstream context-mode_* guidance names are rewritten to the catalog path`,
         `  PreToolUse enforcement: ${routingState.modify + routingState.context + routingState.deny} decision(s) observed (modify ${routingState.modify}, context ${routingState.context}, deny ${routingState.deny})`,
         `  PreToolUse readiness: ${
           sentinel.ready
