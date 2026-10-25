@@ -462,13 +462,17 @@ export default Plugin.define({
         if (existsSync(routingBlockPath)) {
           const { createRoutingBlock } = await import(pathToFileURL(routingBlockPath).href)
           // Code Mode resolves ctx_* only through the execute tool's catalog
-          // (`tools.ctx_*`). A direct native ctx_* call is not parsed by the
-          // harness and stalls the turn, so guidance must name the catalog path.
+          // (`tools.ctx_*`). A direct native ctx_* call is never declared to the
+          // model (it is not in the request's tool list), so the model's raw
+          // <tool_call> for one is either rejected with "No tool named ..." or —
+          // on servers that validate names against the request — returned as
+          // plain text: no tool part, no error, nothing runs. Guidance must name
+          // the catalog path and say the block is a no-op.
           wrapperRoutingBlock =
             createRoutingBlock((bare) => `tools.${bare}`) +
             "\n  <calling_convention>\n" +
             "    On OpenCode, ctx_* tools are callable ONLY inside the `execute` tool as `tools.ctx_*(...)`.\n" +
-            "    A direct native ctx_* tool call is not resolved by the harness and stalls the turn.\n" +
+            "    They are not native tools: a <tool_call> block naming one is dropped silently, so never emit one.\n" +
             "  </calling_convention>\n"
         }
       } catch {
@@ -613,7 +617,7 @@ export default Plugin.define({
         "Routing status",
         `  context-mode ${installedContextModeVersion() ?? "unknown"} · wrapper ${wrapperVersion()}`,
         `  ctx tools registered: ${registeredCtxTools.length} (${registeredCtxTools.join(", ")})`,
-        `  tool naming: tools.ctx_* via Code Mode execute — direct native ctx_* calls stall the turn; upstream context-mode_* guidance names are rewritten to the catalog path`,
+        `  tool naming: tools.ctx_* via Code Mode execute — native ctx_* calls are never dispatched (their <tool_call> is dropped or rejected); upstream context-mode_* guidance names are rewritten to the catalog path`,
         `  PreToolUse enforcement: ${routingState.modify + routingState.context + routingState.deny} decision(s) observed (modify ${routingState.modify}, context ${routingState.context}, deny ${routingState.deny})`,
         `  PreToolUse readiness: ${
           sentinel.ready
