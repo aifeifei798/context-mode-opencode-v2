@@ -1,10 +1,11 @@
 /**
  * OpenCode v2 wrapper for context-mode (mksglu/context-mode).
  *
- * context-mode ships an OpenCode v1-style plugin adapter
- * (`context-mode/build/adapters/opencode/plugin.js`). OpenCode v2 requires
- * plugins that export `Plugin.define({ id, setup })`, so this wrapper calls
- * the upstream v1 factory and re-registers its tools and hooks on the v2 API.
+ * context-mode still ships an OpenCode v1-style factory (`server`) next to its
+ * own v2 `setup`, so this wrapper keeps calling the v1 factory and re-registers
+ * its tools and hooks on the v2 API — that is what keeps the ctx tools in the
+ * Code Mode gateway and preserves the routing/compaction hardening below.
+ * Supports context-mode 1.x (better-sqlite3) and 2.x (node:sqlite).
  *
  * Self-installing: OpenCode does not install npm dependencies for local
  * plugin directories, so this wrapper installs `context-mode` into its own
@@ -29,7 +30,7 @@ const FALLBACK_PACKAGE_JSON = {
   name: "context-mode-opencode-v2",
   version: "1.0.0",
   type: "module",
-  dependencies: { "context-mode": "^1.0.169", zod: "^3.25.0" },
+  dependencies: { "context-mode": "^2.1.0", zod: "^3.25.0" },
   allowScripts: {
     "better-sqlite3": true,
     "context-mode": true,
@@ -66,6 +67,111 @@ function npmInstall(args, timeoutMs) {
     timeout: timeoutMs,
   })
 }
+
+/**
+ * context-mode 1.x exports both "." and "./plugin" (the same adapter); 2.x
+ * dropped the "./plugin" subpath and only exports ".". The bare package
+ * specifier works for both, so try it first.
+ */
+async function importContextModeAdapter() {
+  try {
+    return await import("context-mode")
+  } catch (error) {
+    if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED" && error?.code !== "ERR_MODULE_NOT_FOUND") {
+      throw error
+    }
+    return import("context-mode/plugin")
+  }
+}
+
+function installedContextModeVersion() {
+  try {
+    return JSON.parse(readFileSync(join(CONTEXT_MODE_DIR, "package.json"), "utf8")).version
+  } catch {
+    return null
+  }
+}
+
+function installedContextModeMajor() {
+  const version = installedContextModeVersion()
+  if (!version) return 0
+  return Number.parseInt(String(version).split(".")[0], 10) || 0
+}
+
+/**
+ * context-mode 2.x moved to Node's built-in `node:sqlite`, so better-sqlite3
+ * is neither a dependency nor a load-time requirement there. Only 1.x needs
+ * the native binding, and npm 12 blocks install scripts unless `allowScripts`
+ * declares the package.
+ */
+function needsNativeBinding() {
+  return installedContextModeMajor() < 2
+}
+
+/**
+ * 1.x tool closures returned `{ title, output }`; 2.x returns the bare text.
+ * Normalize both so the wrapper's content/metadata contract is version-agnostic.
+ */
+function normalizeToolResult(result) {
+  if (typeof result === "string") return { output: result, title: null }
+  if (result && typeof result === "object") {
+    return {
+      output: result.output ?? result.content ?? "",
+      title: result.title ?? null,
+    }
+  }
+  return { output: result == null ? "" : String(result), title: null }
+}
+
+/**
+ * Code Mode resolves ctx_* only through the execute tool's catalog
+ * (`tools.ctx_*`). A direct native ctx_* call is never declared to the model
+ * (it is not in the request's tool list), so the model's raw <tool_call> for
+ * one is either rejected with "No tool named ..." or — on servers that validate
+ * names against the request — returned as plain text: no tool part, no error,
+ * nothing runs. Guidance must name the catalog path and say the block is a
+ * no-op.
+ */
+const CALLING_CONVENTION_NOTE =
+  "\n  <calling_convention>\n" +
+  "    On OpenCode, ctx_* tools are callable ONLY inside the `execute` tool as `tools.ctx_*(...)`.\n" +
+  "    They are not native tools: a <tool_call> block naming one is dropped silently, so never emit one.\n" +
+  "  </calling_convention>\n"
+
+/**
+ * context-mode 2.x ships a short INSTRUCTIONS string and no
+ * `hooks/routing-block.mjs`, so the wrapper supplies the routing rules itself.
+ * Tool names follow the 2.x surface (ctx_batch / ctx_index / ctx_resume), not
+ * 1.x's ctx_batch_execute / ctx_fetch_and_index.
+ */
+const FALLBACK_ROUTING_BLOCK = `<context_window_protection>
+  <priority_instructions>
+    Every byte a tool returns enters your conversation memory and costs reasoning capacity for the rest of the session. The context-mode tools do the work in a sandbox and surface only the derived answer — the raw bytes stay out. Program the analysis; do not compute it by reading raw data into the conversation.
+  </priority_instructions>
+  <tool_selection_hierarchy>
+    0. MEMORY: tools.ctx_resume({}) and tools.ctx_search({queries:[...]})
+       - On resume or compaction, read prior decisions, errors and plans before asking the user.
+    1. GATHER: tools.ctx_batch({commands:[...], queries:[...]})
+       - Runs several shell commands, indexes their output and answers search queries over it in one call.
+    2. FOLLOW-UP: tools.ctx_search({queries:["q1","q2"]})
+       - Batch every question about already-indexed output in one array; the ranking pipeline runs per query.
+    3. PROCESSING: tools.ctx_execute({language, code}) and tools.ctx_index({path|url|content})
+       - Filter, count, aggregate, parse; only what the code prints enters the conversation. ctx_index stores a file or page for later ctx_search.
+  </tool_selection_hierarchy>
+  <when_not_to_use>
+    - Bash stays correct when you intend to OBSERVE a short fixed output (git status on a clean tree, whoami, pwd) or when you are mutating state (git, mkdir, rm, mv).
+    - Read stays correct when you intend to Edit the file (Edit needs the exact bytes in your conversation).
+    - Web fetches that you will query later: use tools.ctx_index({url}) then tools.ctx_search.
+  </when_not_to_use>
+  <file_writing_policy>
+    File writes use the native Write or Edit tool — tools.ctx_execute runs in a subprocess and discards the sandbox filesystem. Applies to all file types.
+  </file_writing_policy>
+  <output_constraints>
+    <artifact_policy>
+      Write artifacts (code, configs, PRDs) to files. Return only: file path + 1-line description.
+    </artifact_policy>
+  </output_constraints>
+</context_window_protection>`
 
 function betterSqlite3Root() {
   const roots = [
@@ -131,6 +237,7 @@ function nativeBindingError() {
  */
 function ensureContextMode() {
   if (existsSync(CONTEXT_MODE_DIR)) {
+    if (!needsNativeBinding()) return { ok: true, action: "present" }
     if (nativeBindingPresent()) return { ok: true, action: "present" }
     if (healNativeBinding()) return { ok: true, action: "healed-native-binding" }
     return nativeBindingError()
@@ -153,14 +260,6 @@ function ensureContextMode() {
     ok: false,
     action: "install-failed",
     error: result.error?.message || result.stderr?.trim() || `npm exited with ${result.status}`,
-  }
-}
-
-function installedContextModeVersion() {
-  try {
-    return JSON.parse(readFileSync(join(CONTEXT_MODE_DIR, "package.json"), "utf8")).version
-  } catch {
-    return null
   }
 }
 
@@ -406,7 +505,7 @@ export default Plugin.define({
     }
     const cleanups = [() => sentinel.stop()]
 
-    const adapterMod = await import("context-mode/plugin")
+    const adapterMod = await importContextModeAdapter()
     const createContextModePlugin = adapterMod.server ?? adapterMod.ContextModePlugin
     if (typeof createContextModePlugin !== "function") {
       throw new Error(
@@ -451,6 +550,11 @@ export default Plugin.define({
     // inject it when the real rules are missing.
     let wrapperRoutingBlock = null
     if (ctx.options?.routingBlock !== false && process.env.CONTEXT_MODE_ROUTING_BLOCK !== "0") {
+      // 1.x ships the factory; 2.x dropped it (INSTRUCTIONS only), so start
+      // from the wrapper's own 2.x-aware block and let upstream override it.
+      if (installedContextModeMajor() >= 2) {
+        wrapperRoutingBlock = FALLBACK_ROUTING_BLOCK + CALLING_CONVENTION_NOTE
+      }
       try {
         const routingBlockPath = join(
           PLUGIN_DIR,
@@ -461,22 +565,11 @@ export default Plugin.define({
         )
         if (existsSync(routingBlockPath)) {
           const { createRoutingBlock } = await import(pathToFileURL(routingBlockPath).href)
-          // Code Mode resolves ctx_* only through the execute tool's catalog
-          // (`tools.ctx_*`). A direct native ctx_* call is never declared to the
-          // model (it is not in the request's tool list), so the model's raw
-          // <tool_call> for one is either rejected with "No tool named ..." or —
-          // on servers that validate names against the request — returned as
-          // plain text: no tool part, no error, nothing runs. Guidance must name
-          // the catalog path and say the block is a no-op.
           wrapperRoutingBlock =
-            createRoutingBlock((bare) => `tools.${bare}`) +
-            "\n  <calling_convention>\n" +
-            "    On OpenCode, ctx_* tools are callable ONLY inside the `execute` tool as `tools.ctx_*(...)`.\n" +
-            "    They are not native tools: a <tool_call> block naming one is dropped silently, so never emit one.\n" +
-            "  </calling_convention>\n"
+            createRoutingBlock((bare) => `tools.${bare}`) + CALLING_CONVENTION_NOTE
         }
       } catch {
-        wrapperRoutingBlock = null
+        // Keep the 2.x fallback; a 1.x install without the file has none.
       }
     }
 
@@ -493,8 +586,13 @@ export default Plugin.define({
     const registeredNames = new Set()
     await ctx.tool.transform((editor) => {
       for (const [name, tool] of Object.entries(hooks.tool ?? {})) {
-        registeredCtxTools.push(name)
-        registeredNames.add(name)
+        // `ctx.tool.transform` can run once per registry rebuild in the same
+        // process; the editor needs the tool every time, but the reported
+        // inventory must not accumulate duplicates.
+        if (!registeredNames.has(name)) {
+          registeredCtxTools.push(name)
+          registeredNames.add(name)
+        }
         const shape = tool.args && typeof tool.args === "object" ? tool.args : {}
         editor.add({
           name,
@@ -521,7 +619,9 @@ export default Plugin.define({
               warn(`ctx tool ${name} failed: ${routingState.lastCtxExecError}`)
               throw error
             }
-            let content = String(result?.output ?? "")
+            let content = ""
+            const normalized = normalizeToolResult(result)
+            content = String(normalized.output ?? "")
             // ctx_stats ends with the upstream engine version. OpenCode has no
             // place to show a local plugin's own version (`plugin list` prints
             // "local" for every path-loaded plugin — Plugin.Info carries a
@@ -533,7 +633,7 @@ export default Plugin.define({
             }
             return {
               content,
-              metadata: { title: result?.title ?? name },
+              metadata: { title: normalized.title ?? name },
             }
           },
         })
@@ -836,9 +936,22 @@ export default Plugin.define({
 
     // ── message.updated: token/cost usage capture ───────────────────────
     if (hooks.event) {
+      const adapterMajor = installedContextModeMajor()
       const controller = new AbortController()
       void (async () => {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          // 2.x consumes v2 events as-is (it only cares about
+          // `message.part.updated` / `step-finish`); 1.x expects the v1
+          // `{ event: { properties: { info } } }` shape on `message.updated`.
+          if (adapterMajor >= 2) {
+            if (event?.type !== "message.part.updated") continue
+            try {
+              await hooks.event({ event })
+            } catch {
+              // Usage capture is best-effort; never break the session.
+            }
+            continue
+          }
           if (event.type !== "message.updated") continue
           const info = event.data?.info ?? event.data?.message ?? event.data
           try {

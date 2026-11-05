@@ -63,7 +63,7 @@ OpenCode installs package plugins and their dependencies, and `opencode plugin u
 Notes:
 
 - Requires OpenCode v2.x and Node 18+.
-- `better-sqlite3` is a native dependency. npm 12+ blocks install scripts unless `allowScripts` is declared in **package.json** (the `.npmrc` form is no longer recognised). It is declared here. The wrapper also checks for the compiled binding (`node_modules/better-sqlite3/build/Release/better_sqlite3.node`) and heals it with `npm rebuild better-sqlite3` if it is missing — this is the case when OpenCode installs a package plugin with Bun and skips install scripts.
+- `better-sqlite3` is only a dependency of context-mode **1.x**; 2.x uses Node's built-in `node:sqlite`. For 1.x installs, npm 12+ blocks install scripts unless `allowScripts` is declared in **package.json** (the `.npmrc` form is no longer recognised). It is declared here, and the wrapper checks for the compiled binding (`node_modules/better-sqlite3/build/Release/better_sqlite3.node`) and heals it with `npm rebuild better-sqlite3` if it is missing. The check is skipped entirely on 2.x.
 - Relative plugin paths resolve **from the config file that contains the entry**, so `"./plugins/context-mode-opencode-v2"` in `~/.config/opencode/opencode.json` means `~/.config/opencode/plugins/context-mode-opencode-v2`.
 
 ## Keeping context-mode up to date
@@ -105,8 +105,8 @@ ctx_routing({ verbose: true })
 
 ```
 Routing status
-  context-mode 1.0.169 · wrapper 1.3.2
-  ctx tools registered: 11 (ctx_execute, ctx_search, ...)
+  context-mode 2.1.1 · wrapper 1.4.0
+  ctx tools registered: 9 (ctx_execute, ctx_batch, ctx_index, ...)
   PreToolUse enforcement: 2 decision(s) observed (modify 2, context 0, deny 0)
   PreToolUse readiness: sentinel active (/tmp/context-mode-mcp-ready-12345)
   routing block: injected by wrapper — adapter skipped it because the tool catalog tripped its marker quorum
@@ -126,7 +126,7 @@ This package is a thin adapter, not a fork. Everything except `index.js` (~150 l
 | `index.js` (this repo) | v1 → v2 hook/tool adapter + dependency bootstrap | ~150 lines | MIT |
 | `context-mode/build/adapters/opencode/` | upstream OpenCode adapter | ~1,000 lines | Elastic License 2.0 |
 | `context-mode` core engine | indexing, search, session storage, bundles | ~10,000 lines / ~2.4 MB | Elastic License 2.0 |
-| `better-sqlite3` | native SQLite binding used by the core | native | MIT |
+| `better-sqlite3` | native SQLite binding (context-mode **1.x** only; 2.x uses Node's `node:sqlite`) | native | MIT |
 
 Runtime data (per-session SQLite databases, indexed content) lives in `~/.config/opencode/context-mode/{sessions,content}` and is owned by the upstream engine, not by this wrapper.
 
@@ -142,7 +142,7 @@ opencode plugin check                                            # reports outda
 opencode plugin update                                           # re-resolves the repo
 ```
 
-Verified on OpenCode v2.0.30: the Git path caches the repo under `~/.cache/opencode/npm/git-<name>-<hash>/`, installs `context-mode` as a dependency, and the wrapper heals the missing `better-sqlite3` binding on first load (OpenCode's package install leaves `node_modules/better-sqlite3/build` empty).
+Verified on OpenCode v2.0.30: the Git path caches the repo under `~/.cache/opencode/npm/git-<name>-<hash>/`, installs `context-mode` as a dependency, and (on context-mode 1.x) the wrapper heals the missing `better-sqlite3` binding on first load (OpenCode's package install leaves `node_modules/better-sqlite3/build` empty). context-mode 2.x needs no native binding.
 
 If you do have an npm account, the same package can be published for the bare-name path:
 
@@ -212,8 +212,8 @@ opencode plugin list
 `VERSION` says `local` for every path-loaded plugin — OpenCode's `Plugin.Info` only carries a version for `package` sources (`packages/schema/src/plugin.ts`), and `Plugin.define` has no version field. The wrapper's own version therefore lives where it is actually visible:
 
 ```js
-await tools.ctx_stats()      // footer: "v1.0.169" (upstream) + "wrapper v1.3.2"
-await tools.ctx_routing()    // header: "context-mode 1.0.169 · wrapper 1.3.2"
+await tools.ctx_stats()      // footer: upstream version line + "wrapper v1.4.0"
+await tools.ctx_routing()    // header: "context-mode 2.1.1 · wrapper 1.4.0"
 ```
 
 Only a package install (`opencode plugin add github:...` or npm) would populate the `VERSION` column, at the cost of the hot-edit loop.
@@ -301,9 +301,9 @@ Concurrent agents in the same process share those DBs safely; the `*-wal` / `*-s
 
 ## Caveats
 
-- The wrapper is tested against context-mode **1.0.169** and declares it with a caret range. If upstream changes the adapter export shape (`server` / `ContextModePlugin`) or hook names, the wrapper throws with an actionable message rather than silently loading nothing.
-- The bootstrap also checks for `better-sqlite3`'s native binding (`node_modules/better-sqlite3/build/Release/better_sqlite3.node`). If install scripts were blocked, it reports `native-binding-missing` instead of failing later at runtime.
-- ctx tools are exposed through Code Mode's `execute` catalog; long-running commands inside `ctx_batch_execute` are bounded by the `timeout` argument you pass, not by a platform default.
+- The wrapper is tested against context-mode **2.1.1** (and still supports 1.x) and declares it with a caret range. If upstream changes the adapter export shape (`server` / `ContextModePlugin`), the tool result shape or hook names, the wrapper throws with an actionable message rather than silently loading nothing.
+- On 1.x the bootstrap also checks for `better-sqlite3`'s native binding (`node_modules/better-sqlite3/build/Release/better_sqlite3.node`). If install scripts were blocked, it reports `native-binding-missing` instead of failing later at runtime. 2.x needs no native binding.
+- ctx tools are exposed through Code Mode's `execute` catalog; long-running commands inside `ctx_batch` are bounded by the `timeout` argument you pass, not by a platform default.
 
 ## License
 

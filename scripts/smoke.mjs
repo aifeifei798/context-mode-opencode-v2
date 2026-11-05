@@ -8,7 +8,7 @@
  *
  *   npm run smoke
  */
-import { existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -81,20 +81,40 @@ const ctx = {
 
 const cleanup = await mod.default.setup(ctx)
 
-const expectedTools = [
-  "ctx_execute",
-  "ctx_execute_file",
-  "ctx_index",
-  "ctx_search",
-  "ctx_fetch_and_index",
-  "ctx_batch_execute",
-  "ctx_stats",
-  "ctx_doctor",
-  "ctx_upgrade",
-  "ctx_purge",
-  "ctx_insight",
-  "ctx_routing",
-]
+// context-mode 2.x renamed the tool surface (and dropped ctx_execute_file /
+// ctx_fetch_and_index / ctx_insight), so the expected set is version-aware.
+const cmVersion = JSON.parse(
+  readFileSync(join(PLUGIN_DIR, "node_modules", "context-mode", "package.json"), "utf8"),
+).version
+const cmMajor = Number.parseInt(String(cmVersion).split(".")[0], 10) || 1
+
+const expectedTools = cmMajor >= 2
+  ? [
+      "ctx_execute",
+      "ctx_batch",
+      "ctx_index",
+      "ctx_search",
+      "ctx_resume",
+      "ctx_stats",
+      "ctx_doctor",
+      "ctx_upgrade",
+      "ctx_purge",
+      "ctx_routing",
+    ]
+  : [
+      "ctx_execute",
+      "ctx_execute_file",
+      "ctx_index",
+      "ctx_search",
+      "ctx_fetch_and_index",
+      "ctx_batch_execute",
+      "ctx_stats",
+      "ctx_doctor",
+      "ctx_upgrade",
+      "ctx_purge",
+      "ctx_insight",
+      "ctx_routing",
+    ]
 
 const missing = expectedTools.filter((name) => !tools.some((t) => t.name === name))
 const badSchemas = tools.filter((t) => !t.input || t.input.type !== "object")
@@ -113,6 +133,20 @@ if (stats) {
   console.log("ctx_stats output:", statsText.slice(0, 120).replace(/\n/g, " "))
   console.log("ctx_stats carries wrapper version:", statsVersionOk)
   console.log("ctx_stats metadata:", JSON.stringify(out.metadata))
+}
+
+// Exercise a real tool call through the wrapper. context-mode 2.x returns a
+// bare string from tool.execute while 1.x returned { title, output }; both must
+// land in `content`.
+const exec = tools.find((t) => t.name === "ctx_execute")
+let execOk = false
+if (exec) {
+  const out = await exec.execute(
+    { language: "shell", code: "echo smoke-exec-ok" },
+    { sessionID: "ses_smoke", directory: PLUGIN_DIR },
+  )
+  execOk = String(out.content).includes("smoke-exec-ok")
+  console.log("ctx_execute round trip:", execOk)
 }
 
 // ── routing block injection + tool-name normalization ────────────────────
@@ -152,9 +186,17 @@ let sentinelOk = false
 const beforeHook = handlers["tool.execute.before"]
 if (beforeHook) {
   const event = { tool: "shell", sessionID: "ses_smoke_routing", input: { command: "curl -s https://example.com" } }
-  await beforeHook(event)
-  const rewritten = String(event.input.command ?? "")
-  redirectOk = rewritten.includes("redirected") && rewritten.includes("ctx_execute") && !rewritten.includes("context-mode_ctx_")
+  try {
+    await beforeHook(event)
+    const rewritten = String(event.input.command ?? "")
+    redirectOk = rewritten.includes("redirected") && rewritten.includes("ctx_execute") && !rewritten.includes("context-mode_ctx_")
+  } catch (error) {
+    // 2.x denies curl/wget outright (exit 2 → thrown) instead of rewriting the
+    // command; the denial text must still point at ctx_execute.
+    redirectOk = cmMajor >= 2 &&
+      /ctx_execute/.test(String(error?.message ?? "")) &&
+      !/context-mode_ctx_/.test(String(error?.message ?? ""))
+  }
   console.log("curl redirect rewritten:", redirectOk)
   sentinelOk = existsSync(join(sentinelDir, `context-mode-mcp-ready-${process.pid}`))
   console.log("readiness sentinel:", sentinelOk)
@@ -233,7 +275,7 @@ if (typeof cleanup === "function") cleanup()
 if (createdStub) rmSync(stubDir, { recursive: true, force: true })
 rmSync(sentinelDir, { recursive: true, force: true })
 
-if (missing.length || badSchemas.length || !statsVersionOk || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk || !staleOk) {
+if (missing.length || badSchemas.length || !statsVersionOk || !execOk || !injectionOk || !wrapperInjectionOk || !namingOk || !redirectOk || !reportOk || !staleOk) {
   console.error(
     "FAILED:",
     missing.length ? "missing tools " + missing.join(",") : "",
@@ -242,6 +284,7 @@ if (missing.length || badSchemas.length || !statsVersionOk || !injectionOk || !w
     !wrapperInjectionOk ? "wrapper did not supply routing rules when adapter skipped" : "",
     !namingOk ? "routing guidance not normalized" : "",
     !statsVersionOk ? "ctx_stats does not report the wrapper version" : "",
+    !execOk ? "ctx_execute round trip failed (result normalization)" : "",
     !sentinelOk ? "MCP readiness sentinel not written (PreToolUse redirects stay disabled)" : "",
     !redirectOk ? "PreToolUse redirect not normalized" : "",
     !reportOk ? "ctx_routing report malformed" : "",
